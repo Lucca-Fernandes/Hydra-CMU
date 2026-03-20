@@ -1,91 +1,104 @@
-# 📘 Solatio Energy Livre - Documentação de Integração (Dashboard)
+📘 Solatio Energy Livre - Dashboard & Sync Service
+Este repositório contém a solução completa para gestão de Unidades Consumidoras (UCs) e Faturas da Solatio. A arquitetura foi evoluída de um consumo direto de API externa para um modelo de Espelhamento de Dados (Data Sync), garantindo performance de milissegundos em consultas complexas.
 
-Este documento detalha a arquitetura, endpoints e regras de negócio utilizadas na integração entre o Frontend (React) e a API da Solatio para a gestão de Unidades Consumidoras e Faturas.
+🚀 1. Arquitetura do Sistema
+A solução é dividida em três camadas principais:
 
----
+Sync Service (Node.js): Script de alto desempenho que consome os endpoints da Hydra V1 (Solatio) e popula o banco de dados Postgres.
 
-## 🚀 1. Visão Geral do Fluxo
-O sistema permite que o usuário visualize o histórico de faturas de uma Unidade Consumidora (UC), acessando tanto o demonstrativo gerado pela **Solatio** quanto a fatura original da **Concessionária (Ex: CEMIG)**. Além disso, consolida os indicadores de saldo de energia injetada.
+Backend API (Express + PG): Ponte de comunicação que realiza buscas globais e filtros avançados diretamente no banco de dados.
 
----
+Frontend (React + Material UI): Dashboard interativo para visualização de indicadores, faturas e status financeiro.
 
-## 🔗 2. Endpoints e Autenticação
+📦 2. Estrutura do Banco de Dados (PostgreSQL/Neon)
+Utilizamos a estratégia de JSONB Storage para manter a fidelidade aos dados da API original sem perder a flexibilidade do SQL.
 
-### Ambientes
-- **Desenvolvimento:** `https://dev-server.solatioenergialivre.com.br`
-- **Produção:** `https://server.solatioenergialivre.com.br`
+Tabelas Principais:
+cmu_contacts: Dados de contato e representantes legais.
 
-### Autenticação
-As requisições devem incluir o Header:
-`Authorization: Bearer {SEU_TOKEN_JWT}`
+cmu_energy_meters: Unidades consumidoras, endereços e saldos de kWh.
 
----
+cmu_energy_meter_invoices: Histórico de faturamentos e links de PDFs.
 
-## 🏗️ 3. Entidades Principais e Relacionamentos
+cmu_leads: Gestão de prospecção e novos clientes.
 
-### A. EnergyMeters (Unidades Consumidoras)
-Representa o cliente e sua instalação física. Contém os dados de saldo acumulado.
-- **Endpoint:** `GET /EnergyMeters`
-- **Identificador:** `energyMeterID`
+🔄 3. O Sync Service (Carga de Dados)
+O serviço de sincronização (sync.js) utiliza Paralelismo e Upsert para garantir velocidade.
 
-### B. EnergyMeterInvoices (Demonstrativos Solatio)
-Fatura gerada pela Solatio com os benefícios/descontos.
-- **Endpoint:** `GET /EnergyMeterInvoices`
-- **Filtro Recomendado:** `?filters={"energyMeterID": 123}&rawData=false`
-- **Campo PDF:** `energyInvoiceFile`
+Como funciona:
+Paralelismo: Busca 5 páginas simultâneas da API Solatio.
 
-### C. EnergyMeterBills (Contas da Distribuidora)
-A fatura bruta da concessionária (CEMIG, etc).
-- **Endpoint:** `GET /EnergyMeterBills/{id}`
-- **Identificador:** `energyMeterBillID`
-- **Campo PDF:** `energyBillFile`
+Performance: Utiliza ON CONFLICT DO NOTHING para ignorar registros já existentes, focando apenas em novos dados.
 
----
+Configuração: Localizado em /sync-service.
 
-## 🛠️ 4. Regras de Negócio e Implementação Técnica
+Comando para rodar a carga:
 
-### 📊 Lógica de Saldos (KPIs)
-Existem dois tipos de saldo no sistema, ambos localizados dentro do objeto `energyMeter`:
+Bash
+node sync.js
+🔗 4. API de Consulta (Backend Local)
+Diferente da API original, nosso backend realiza buscas case-insensitive e globais dentro do JSON.
 
-1.  **`lastInvoiceEnergyBalance` (Principal):** Saldo acumulado de energia (kWh) após o processamento do último demonstrativo Solatio. É o crédito que o cliente possui para abates futuros.
-2.  **`lastBillEnergyBalance` (Secundário):** Saldo remanescente diretamente na concessionária. Representa a "sobra" de energia injetada que ficou acumulada no medidor da distribuidora.
+Endpoints Customizados:
+GET /api/EnergyMeters: Lista UCs.
 
-### O Parâmetro `rawData`
-Este é o parâmetro mais importante da API Solatio:
-- `rawData=true` (Default): Otimiza a resposta omitindo objetos filhos e URLs de arquivos. **Os botões de PDF ficarão desabilitados.**
-- `rawData=false`: **Obrigatório** para o Dashboard. Retorna os objetos `energyMeterBill` e as URLs de PDF.
+Lógica de Busca: Converte o JSON para texto (data::text) permitindo achar termos em qualquer campo (Nome, Fantasia, CPF, Medidor).
 
-### Tratamento de Duplicatas (Mês de Referência)
-A API retorna o histórico completo de tentativas de faturamento. Para exibir apenas uma linha por mês no Frontend:
-1. Ordene por data de criação (`createdAt` ou `updatedAt`).
-2. Mantenha apenas o registro mais recente ou com status `Faturado`.
+GET /api/EnergyMeterInvoices: Retorna faturas de uma UC específica já ordenadas por mês de referência.
 
----
+Filtros Suportados (via JSON Query):
 
-## 📊 5. Mapeamento de Campos (UI vs API)
+JavaScript
+{
+  "name": "Padaria",
+  "energyMeterStatus": "Ativa",
+  "pendingPayments": { ">": 0 } // Filtro para inadimplentes
+}
+🛠 5. Integração com o Frontend (React)
+Para conectar o Dashboard ao novo ecossistema, o arquivo src/api/api.js deve apontar para o servidor local:
 
-| Coluna UI | Propriedade API | Tratamento / Formatação |
-| :--- | :--- | :--- |
-| **Mês Ref.** | `referenceMonth` | `date-fns` ou `Intl.DateTimeFormat` (MM/YYYY) |
-| **Saldo (kWh)** | `energyMeter.lastInvoiceEnergyBalance` | `Intl.NumberFormat` (pt-BR) |
-| **Valor Solatio** | `totalAmount` | `Intl.NumberFormat` (BRL) |
-| **Economia** | `economyValue` | `Intl.NumberFormat` (BRL) |
-| **Status** | `energyMeterInvoiceStatus` | Mapear strings para Cores (Chip/Badge) |
-| **PDF Solatio** | `energyInvoiceFile` | Link direto (S3/Cloudfront) |
-| **PDF CEMIG** | `energyMeterBill.energyBillFile` | Link direto (S3/Cloudfront) |
+JavaScript
+export const BASE_URL = 'http://localhost:3001/api';
+Exemplo de Chamada no Componente:
+JavaScript
+const url = `/EnergyMeters?filters=${encodeURIComponent(JSON.stringify(filters))}`;
+const res = await fetchApi(url);
+📊 6. Regras de Negócio Implementadas
+A. Busca Global "Smart"
+A busca por texto no Dashboard não se limita ao nome. Graças ao operador ILIKE no Postgres, o sistema encontra:
 
----
+Nome do Cliente
 
-## ⚠️ 6. Troubleshooting (FAQ)
+Nome Fantasia (businessName)
 
-**1. Erro 401 (Unauthorized) no Swagger?**
-O token JWT expira periodicamente. Pegue o token atual na aba *Network* do navegador enquanto estiver logado na aplicação.
+Número da Instalação (meterNumber)
 
-**2. PDF da CEMIG não abre?**
-Verifique se o `energyMeterBillID` não é nulo. Caso seja, utilize `GET /EnergyMeterBills/{id}` para buscar o dado atualizado via Lazy Loading.
+CPF/CNPJ (registrationNumber)
 
-**3. Tela Branca/Preta ao carregar saldos?**
-Sempre utilize *Optional Chaining* (`row.energyMeter?.lastInvoiceEnergyBalance`) para evitar erros caso a UC não possua dados de saldo vinculados.
+B. Gestão de Status Financeiro
+O campo pendingPayments é tratado no banco como um inteiro. No Frontend:
 
----
-*Documentação atualizada em: 18 de Março de 2026*# Hydra-CMU
+pendingPayments > 0: Exibe Badge "Débito" (Vermelho).
+
+pendingPayments = 0: Exibe Badge "Em dia" (Verde).
+
+C. Tratamento de PDFs
+O parâmetro rawData=false foi fixado no backend para garantir que as URLs do S3 (energyInvoiceFile) estejam sempre disponíveis para visualização imediata no DataGrid.
+
+⚠️ 7. Troubleshooting & Manutenção
+1. O número de registros no Dashboard está menor que no Neon?
+
+Certifique-se de que o backend está usando ILIKE e pesquisando no data::text.
+
+Verifique o LIMIT na query SQL do server.js (padrão 50 ou 100).
+
+2. Erro de Conexão (ECONNRESET) no Sync?
+
+O script de sincronização já possui tratamento para ignorar falhas momentâneas e continuar o processo. Basta rodar node sync.js novamente para preencher lacunas.
+
+3. Backend não inicia?
+
+Verifique se o arquivo .env na raiz do projeto contém a variável DATABASE_URL apontando para o seu cluster do Neon.
+
+Última atualização: 20 de Março de 2026
+Responsável: lUCCA F
