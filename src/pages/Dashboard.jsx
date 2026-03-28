@@ -86,7 +86,6 @@ export default function Dashboard() {
         <PeriodFilter onApply={handleFilter} />
       </Paper>
 
-      {/* KPIs - Linha 1 */}
       <Grid container spacing={2} sx={{ mb: 2 }}>
         <Grid size={{ xs: 6, md: 3 }}>
           <KPICard title="MEDIDORES ATIVOS" value={activeMeters.toLocaleString('pt-BR')} icon={<ElectricBoltIcon />} subtitle={`${totalMeters.toLocaleString('pt-BR')} total`} />
@@ -102,7 +101,6 @@ export default function Dashboard() {
         </Grid>
       </Grid>
 
-      {/* KPIs - Linha 2 */}
       <Grid container spacing={2} sx={{ mb: 3 }}>
         <Grid size={{ xs: 6, md: 3 }}>
           <KPICard title="ENERGIA COMPENSADA" value={`${formatNumber(stats.energy?.compensated)} kWh`} icon={<EnergySavingsLeafIcon />} color="#0288d1" subtitle={`Eficiencia: ${(stats.energy?.efficiency || 0).toFixed(1)}%`} />
@@ -118,7 +116,6 @@ export default function Dashboard() {
         </Grid>
       </Grid>
 
-      {/* Charts - Linha 1: Faturamento + Status + Estado */}
       <Grid container spacing={2} sx={{ mb: 2 }}>
         <Grid size={{ xs: 12, md: 7 }}>
           <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 340 }}>
@@ -175,7 +172,6 @@ export default function Dashboard() {
         </Grid>
       </Grid>
 
-      {/* Charts - Linha 2: Distribuidoras + Classe + Top Parceiros */}
       <Grid container spacing={2} sx={{ mb: 2 }}>
         <Grid size={{ xs: 12, md: 4 }}>
           <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 280 }}>
@@ -237,7 +233,6 @@ export default function Dashboard() {
         </Grid>
       </Grid>
 
-      {/* Tables: Faturas + Pagamentos por Status */}
       <Grid container spacing={2}>
         <Grid size={{ xs: 12, md: 6 }}>
           <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px' }}>

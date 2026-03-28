@@ -2,7 +2,6 @@ import React, { useState, useCallback } from 'react';
 import { Card, CardContent, Stack, Typography, Box, Grid, Chip, Tooltip as MuiTooltip, TextField, Button } from '@mui/material';
 import ClearIcon from '@mui/icons-material/Clear';
 
-// --- Formatadores ---
 export const formatCurrency = (v) =>
   new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(v || 0);
 
@@ -21,7 +20,6 @@ export const formatFullDate = (ds) => {
   return new Date(ds).toLocaleDateString('pt-BR');
 };
 
-// --- Status Badge ---
 const statusConfigs = {
   'Pago': { color: 'success', label: 'Pago' },
   'Liquidado': { color: 'success', label: 'Liquidado' },
@@ -45,7 +43,6 @@ export const StatusBadge = ({ status, description }) => {
   return badge;
 };
 
-// --- KPI Card ---
 export const KPICard = ({ title, value, icon, color = "primary.main", subtitle }) => (
   <Card variant="outlined" sx={{ height: '100%', boxShadow: '0 2px 4px rgba(0,0,0,0.05)', borderRadius: '12px' }}>
     <CardContent sx={{ p: 2 }}>
@@ -59,7 +56,6 @@ export const KPICard = ({ title, value, icon, color = "primary.main", subtitle }
   </Card>
 );
 
-// --- Info Card ---
 export const InfoCard = ({ title, icon, children }) => (
   <Card variant="outlined" sx={{ borderRadius: '12px', height: '100%', boxShadow: '0 2px 4px rgba(0,0,0,0.02)' }}>
     <Box sx={{ p: 2, bgcolor: '#f8f9fa', borderBottom: '1px solid #eee', display: 'flex', alignItems: 'center', gap: 1 }}>
@@ -118,7 +114,6 @@ export const PeriodFilter = ({ onApply, extraFilters }) => {
   );
 };
 
-// --- Data Field ---
 export const DataField = ({ label, value }) => (
   <Grid size={12}>
     <Typography variant="caption" color="text.secondary" sx={{ fontWeight: '700', textTransform: 'uppercase', fontSize: '0.6rem', display: 'block' }}>{label}</Typography>
