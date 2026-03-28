@@ -1,71 +1,123 @@
-require('dotenv').config({ path: '../.env' });
 const axios = require('axios');
 const { Pool } = require('pg');
+const path = require('path');
+require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const pool = new Pool({ 
-    connectionString: process.env.DATABASE_URL,
-    max: 20 
+    connectionString: process.env.DATABASE_URL, 
+    ssl: { rejectUnauthorized: false } 
 });
 
-const ENDPOINTS = [
-  { path: '/Contacts', table: 'cmu_contacts', pk: 'contactID' },
-  { path: '/Customers', table: 'cmu_customers', pk: 'customerID' },
-  { path: '/EnergyMeterBills', table: 'cmu_energy_meter_bills', pk: 'energyMeterBillID' },
-  { path: '/EnergyMeterInvoices', table: 'cmu_energy_meter_invoices', pk: 'energyMeterInvoiceID' },
-  { path: '/EnergyMeterPayments', table: 'cmu_energy_meter_payments', pk: 'energyMeterPaymentID' },
-  { path: '/EnergyMeters', table: 'cmu_energy_meters', pk: 'energyMeterID' },
-  { path: '/Leads', table: 'cmu_leads', pk: 'leadID' },
-  { path: '/Prospectors', table: 'cmu_prospectors', pk: 'prospectorID' },
-  { path: '/Tickets', table: 'cmu_tickets', pk: 'ticketID' },
-  { path: '/Vouchers', table: 'cmu_vouchers', pk: 'voucherID' },
-  { path: '/ProspectorAPI/Data', table: 'cmu_prospector_consolidated_data', pk: 'registrationNumber' }
-];
-async function syncEndpointFast(target) {
-    let page = 1;
+const api = axios.create({
+    baseURL: process.env.VITE_API_BASE_URL || process.env.CMU_API_BASE_URL,
+    headers: { 'Authorization': `Bearer ${process.env.VITE_API_TOKEN}` },
+    timeout: 180000,
+    // Isso mantém a conexão aberta e evita erros de rede bobos
+    httpsAgent: new https.Agent({ keepAlive: true }) 
+});
+
+async function syncEndpoint(endpoint, tableName, idField) {
+    console.log(`\n--- 🔄 Sincronizando: ${endpoint} ---`);
+    
+    // Garante que o controle de sincronização existe
+    await pool.query(`
+        INSERT INTO sync_control (endpoint_name, last_page_processed) 
+        VALUES ($1, 1) ON CONFLICT (endpoint_name) DO NOTHING
+    `, [endpoint]);
+
+    const resControl = await pool.query("SELECT last_page_processed FROM sync_control WHERE endpoint_name = $1", [endpoint]);
+    let currentPage = resControl.rows[0].last_page_processed;
+    
     let hasMore = true;
-    console.log(`🚀 Iniciando carga ultra-rápida: ${target.path}`);
+    const pageSize = 15; 
 
     while (hasMore) {
-        const pagesToFetch = [page, page + 1, page + 2, page + 3, page + 4];
-        
-        const requests = pagesToFetch.map(p => 
-            axios.get(`${process.env.CMU_API_BASE_URL}${target.path}`, {
-                params: { page: p, pageSize: 100 },
-                headers: { 'Authorization': `Bearer ${process.env.CMU_API_TOKEN}` }
-            }).catch(e => ({ data: [] })) 
-        );
+        try {
+            console.log(`> [${endpoint}] Lendo página ${currentPage}...`);
+            const response = await api.get(`/${endpoint}?page=${currentPage}&pageSize=${pageSize}&rawData=true`);
+            
+            // Com rawData=true, os itens geralmente vêm direto em response.data
+            const items = response.data;
 
-        const results = await Promise.all(requests);
-        const allItems = results.flatMap(r => r.data);
+            if (!items || items.length === 0) {
+                console.log(`✅ ${endpoint} finalizado.`);
+                hasMore = false;
+                break;
+            }
 
-        if (allItems.length === 0) {
-            hasMore = false;
-            break;
+            const client = await pool.connect();
+            try {
+                await client.query('BEGIN');
+                for (const item of items) {
+                    // --- LÓGICA DE CAPTURA DE ID CORRIGIDA ---
+                    // 1. Tenta o idField na raiz (Ex: item.energyMeterBillID)
+                    // 2. Tenta o idField dentro de .data (caso a API mude o comportamento)
+                    // 3. Tenta 'id' genérico como última opção
+                    let id = item[idField] || (item.data ? item.data[idField] : null) || item.id;
+                    
+                    if (!id) {
+                        // Se não encontrar o ID, ignora o registro para não quebrar o loop
+                        continue; 
+                    }
+
+                    // Define o objeto de dados que será salvo na coluna JSONB
+                    const finalData = item.data ? item.data : item;
+
+                    // Captura o vínculo com o medidor
+                    const meterId = item.energyMeterID || (item.data ? item.data.energyMeterID : null) || item.energy_meter_id || null;
+
+                    if (tableName === 'cmu_energy_meters') {
+                        await client.query(`
+                            INSERT INTO ${tableName} (id, name, data)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, data = EXCLUDED.data, updated_at = NOW()
+                        `, [id, finalData.name || finalData.alias || 'Sem Nome', finalData]);
+                    } else {
+                        await client.query(`
+                            INSERT INTO ${tableName} (id, energy_meter_id, data)
+                            VALUES ($1, $2, $3)
+                            ON CONFLICT (id) DO UPDATE SET energy_meter_id = EXCLUDED.energy_meter_id, data = EXCLUDED.data, updated_at = NOW()
+                        `, [id, meterId, finalData]);
+                    }
+                }
+
+                // Atualiza o progresso no banco
+                await client.query("UPDATE sync_control SET last_page_processed = $1, updated_at = NOW() WHERE endpoint_name = $2", [currentPage, endpoint]);
+                await client.query('COMMIT');
+                currentPage++;
+            } catch (err) {
+                await client.query('ROLLBACK');
+                throw err;
+            } finally {
+                client.release();
+            }
+        } catch (error) {
+            console.error(`⚠️ Erro em ${endpoint} (Pág ${currentPage}):`, error.message);
+            // Aguarda 5 segundos para retry em caso de erro de rede ou API
+            await new Promise(r => setTimeout(r, 5000));
         }
-
-        for (const item of allItems) {
-            const idValue = item[target.pk];
-            if (!idValue) continue;
-
-            const tableIdCol = (target.table === 'cmu_energy_meters') ? 'energy_meter_id' : 'id';
-
-            await pool.query(`
-                INSERT INTO ${target.table} (${tableIdCol}, data, last_sync)
-                VALUES ($1, $2, NOW())
-                ON CONFLICT (${tableIdCol}) DO NOTHING
-            `, [idValue, item]);
-        }
-
-        console.log(`✅ ${target.table}: Processadas páginas ${page} até ${page + 4}`);
-        page += 5;
     }
 }
 
-async function runFullLoad() {
-    console.time('TempoTotal');
-    await Promise.all(ENDPOINTS.map(target => syncEndpointFast(target)));
-    console.timeEnd('TempoTotal');
-    console.log('🏁 Carga massiva finalizada!');
+async function runFullSync() {
+    try {
+        console.log('🚀 INICIANDO SINCRONIZAÇÃO COMPLETA...');
+        
+        // 1. Medidores
+        await syncEndpoint('EnergyMeters', 'cmu_energy_meters', 'id');
+        
+        // 2. Contas (Bills) - Usando o ID confirmado no Swagger
+        await syncEndpoint('EnergyMeterBills', 'cmu_energy_meter_bills', 'energyMeterBillID');
+        
+        // 3. Faturas (Invoices) - Usando o ID confirmado no seu JSON
+        await syncEndpoint('EnergyMeterInvoices', 'cmu_energy_meter_invoices', 'energyMeterInvoiceID');
+        
+        console.log('\n✨ BANCO DE DADOS TOTALMENTE SINCRONIZADO!');
+    } catch (e) {
+        console.error('🔥 Erro fatal durante a sincronização:', e.message);
+    } finally {
+        await pool.end();
+    }
 }
 
-runFullLoad();
+runFullSync();
