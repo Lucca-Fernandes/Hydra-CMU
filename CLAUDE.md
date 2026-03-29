@@ -2,206 +2,263 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## MISSAO DO PROXIMO AGENTE
+
+**Migrar este projeto de Neon Postgres + Express local para Supabase + novo frontend.**
+
+O backend atual (Express em `sync-service/server.js`) sera substituido pelo **Supabase client (`@supabase/supabase-js`)** chamando diretamente o Postgres do Supabase. O frontend sera refeito em outro padrao mas com **funcionalidades identicas** as atuais.
+
+O sync de dados (`sync-service/sync_v2.js`) continuara rodando como script Node.js, apenas apontando o `DATABASE_URL` para o Supabase Postgres.
+
+---
+
 ## Project Overview
 
-Sistema de gestao e **Power Analytics** para a **Solatio Energia Livre** — empresa de energia solar por geracao distribuida (GD). O dashboard monitora usinas, medidores de consumo (UCs), faturas, pagamentos e eficiencia operacional.
+Sistema de **Power Analytics** para a **Solatio Energia Livre** — empresa de energia solar por geracao distribuida (GD). Monitora usinas, medidores de consumo (UCs), faturas, pagamentos e eficiencia operacional.
 
-**Escala**: ~6.000 medidores, ~19.000 faturas, ~14.000 pagamentos.
+**Escala**: ~8.000 medidores, ~20.000 faturas, ~14.000 pagamentos, ~15.000 bills.
 
-## Architecture
-
-Dois apps independentes no mesmo repo:
+## Arquitetura Atual (antes da migracao)
 
 ```
-External CMU API (Swagger/REST)
+API CMU Solatio (REST externa)
         |
-        v
-  [sync scripts]  -->  Neon Postgres (JSONB)
-                              |
-                              v
-                    [Express API :3001]
-                              |
-                              v
-                    [React SPA (Vite)]
+  [sync_v2.js]  -->  Neon Postgres (JSONB)
+                           |
+                     [Express :3001]  <--  server.js (5 rotas)
+                           |
+                     [React SPA (Vite)]
 ```
 
-1. **Frontend** (root) — React 19 + Vite, MUI v7, MUI X DataGrid v8. Sem routing; `App.jsx` renderiza `Clientes` diretamente. `Rateio.jsx` existe mas nao esta conectado ao app.
+## Arquitetura Alvo (apos migracao)
 
-2. **Backend** (`sync-service/`) — Express 5 com `package.json` proprio. Serve API REST na porta 3001. Scripts de sync puxam dados da API CMU para o Neon Postgres.
-
-## Commands
-
-```bash
-# Frontend (raiz)
-npm install
-npm run dev          # Vite dev server
-npm run build        # Build producao
-npm run lint         # ESLint flat config
-
-# Backend (sync-service/)
-cd sync-service && npm install
-node server.js       # API Express na porta 3001
-
-# Sync V2 (principal)
-node sync_v2.js                                # Incremental (default) — so pega alteracoes desde ultimo sync
-node sync_v2.js --full                         # Re-sync completo de todos os endpoints
-node sync_v2.js --endpoint=EnergyMeters        # Incremental de um endpoint especifico
-node sync_v2.js --full --endpoint=Contacts     # Full de um endpoint especifico
-
-# Scripts legados (referencia)
-node sync_final.js   # Sync v1 — apenas 4 endpoints, sem incremental
-node check_one.js    # Cruzamento de dados API vs banco para um medidor especifico
+```
+API CMU Solatio (REST externa)
+        |
+  [sync_v2.js]  -->  Supabase Postgres (mesmo schema JSONB)
+                           |
+                     [@supabase/supabase-js]  <--  chamadas diretas do frontend
+                           |
+                     [React SPA (Vite) — novo padrao de UI]
 ```
 
-Ambos devem rodar simultaneamente: `npm run dev` + `node sync-service/server.js`.
+**O que muda**:
+- `server.js` (Express) **deixa de existir** — as queries SQL que estao nele devem ser convertidas em chamadas via Supabase client ou RPC functions
+- Frontend chama Supabase diretamente via `supabase.rpc()` ou `supabase.from().select()`
+- `sync_v2.js` continua igual, apenas troca `DATABASE_URL` no `.env`
 
-## Environment Variables
+**O que NAO muda**:
+- Schema do banco (JSONB) — identico
+- Funcionalidades do frontend — identicas
+- Script de sync — identico
 
-Root `.env` (compartilhado — sync-service le com `path: '../.env'`):
-- `DATABASE_URL` — connection string Neon Postgres (com SSL)
-- `VITE_API_BASE_URL` / `CMU_API_BASE_URL` — URL base da API CMU Solatio
-- `VITE_API_TOKEN` / `CMU_API_TOKEN` — Bearer token da API CMU
+---
 
-## Database Schema (Neon Postgres)
+## TODAS AS TABELAS DO BANCO (schema JSONB)
 
-Padrao JSONB: cada tabela armazena o payload completo da API na coluna `data` (JSONB), consultada com operadores `->>`.
+Padrao: cada tabela tem coluna `data` (JSONB) com o payload completo da API CMU. Queries usam operadores `->>` e `->`.
 
-### Tabelas
+### `cmu_energy_meters` — Medidores/Clientes (~8.000)
 
-#### `cmu_energy_meters` — Medidores/Clientes (~6.000)
-| Coluna | Tipo | Descricao |
+```sql
+CREATE TABLE cmu_energy_meters (
+    id          INT PRIMARY KEY,  -- energyMeterID da API
+    name        TEXT,              -- extraido do JSONB para busca
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Campos JSONB usados pelo frontend**:
+| Campo | Tipo | Uso |
 |---|---|---|
-| `id` | int PK | `energyMeterID` da API |
-| `name` | text | Nome do cliente (extraido do JSONB) |
-| `data` | jsonb | Payload completo do medidor |
-| `updated_at` | timestamptz | Ultima atualizacao |
+| `energyMeterID` | int | ID unico |
+| `name` | string | Nome do cliente |
+| `meterNumber` | string | Numero da instalacao |
+| `customerNumber` | string | Numero do cliente na concessionaria |
+| `registrationNumber` | string | CPF/CNPJ |
+| `energyMeterStatus` | string | "Ativa", "Desconectada", "Cancelada" |
+| `contractConsumption` | float | kWh contratado (meta mensal) |
+| `discountEstimative` | float | % desconto no contrato |
+| `expiredPaymentsTotalAmount` | float | Valor total vencido (R$) |
+| `pendingPayments` | int | Qtd de pagamentos pendentes |
+| `address` | string | Endereco completo |
+| `addressCity` | string | Cidade |
+| `addressState` | string | UF (MG, GO, BA...) |
+| `addressStreet` | string | Logradouro |
+| `addressNumber` | string | Numero |
+| `addressDistrict` | string | Bairro |
+| `addressPostalCode` | string | CEP |
+| `emails` | string | **SEMPRE VAZIO** — nao usar |
+| `phones` | string | **SEMPRE VAZIO** — nao usar |
+| `connection` | string | Monofasico/Bifasico/Trifasico |
+| `class` | string | Residencial/Comercial/Rural/Industrial |
+| `tariffSubgroup` | string | B1/B2/B3 |
+| `contractStatus` | string | Status do contrato |
+| `paymentMethod` | string | Boleto/Cartao/PIX |
+| `billingMode` | string | Modo de cobranca |
+| `organization` | string | Organizacao |
+| `prospector` | string | Nome do parceiro (campo plano) |
+| `distributor` | object | `{ alias, ... }` — dados da concessionaria |
+| `voucher` | object | `{ code, prospector: { name, contactEmail, phone, userID }, ... }` |
+| `customer` | object | `{ userID, email, phone, ... }` — perfil de acesso |
 
-**Campos JSONB principais**: `energyMeterID`, `name`, `meterNumber` (instalacao), `customerNumber`, `registrationNumber` (CPF/CNPJ), `energyMeterStatus` (Ativa/Desconectada/etc), `contractConsumption` (kWh contratado), `discountEstimative` (% desconto), `expiredPaymentsTotalAmount`, `pendingPayments`, `address`, `addressCity`, `addressState`, `emails`, `phones`, `connection` (Monofasico/Bifasico/Trifasico), `class` (Residencial/Comercial), `tariffSubgroup` (B1/B2/B3), `contractStatus`, `distributor` (objeto com dados da concessionaria CEMIG/COELBA/etc), `voucher` (objeto com dados do prospector/parceiro), `customer` (objeto com dados de acesso).
+### `cmu_energy_meter_invoices` — Faturas Solatio (~20.000)
 
-#### `cmu_energy_meter_invoices` — Faturas Solatio (~19.000)
-| Coluna | Tipo | Descricao |
+```sql
+CREATE TABLE cmu_energy_meter_invoices (
+    id              INT PRIMARY KEY,  -- energyMeterInvoiceID
+    energy_meter_id INT,              -- FK para cmu_energy_meters
+    data            JSONB NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Campos JSONB usados**:
+| Campo | Tipo | Uso |
 |---|---|---|
-| `id` | int PK | `energyMeterInvoiceID` da API |
-| `energy_meter_id` | int FK | Vinculo com medidor |
-| `data` | jsonb | Payload completo da fatura |
-| `updated_at` | timestamptz | |
+| `energyMeterInvoiceID` | int | ID |
+| `energyMeterID` | int | FK medidor |
+| `referenceMonth` | string (ISO date) | Mes de referencia, sempre 1o dia (ex: "2025-01-01T00:00:00") |
+| `consumedEnergy` | float | kWh consumido pelo cliente |
+| `compensatedEnergy` | float | kWh gerado/injetado pela usina solar |
+| `totalAmount` | float | Valor da fatura Solatio (R$) |
+| `energyMeterInvoiceStatus` | string | **"Faturado" / "Disponível" / "Cancelado" / "Retido" / "Reprovado"** |
+| `energyInvoiceFile` | string (URL) | PDF da fatura no S3 |
+| `energyMeterBillID` | int | FK para bill da concessionaria |
+| `statusDescription` | string | Historico textual |
+| `economyValue` | float | Economia gerada (R$) |
+| `registrationNumber` | string | CPF/CNPJ |
+| `organization` | string | Organizacao |
 
-**Campos JSONB principais**: `energyMeterInvoiceID`, `energyMeterID`, `referenceMonth` (ISO date, 1o dia do mes), `consumedEnergy` (kWh), `compensatedEnergy` (kWh gerado pela usina), `totalAmount` (valor Solatio R$), `energyMeterInvoiceStatus` (Faturado/Disponível/Cancelado/Retido/Reprovado — NAO existe "Liquidado" nem "Pendente"), `energyInvoiceFile` (URL do PDF S3), `energyMeterBillID` (FK para bill), `statusDescription` (historico textual de acoes), `icmsRefund`, `economyValue`, `solatioEconomyAmount`, `equivalentAmount`, `consumedEnergyTariff`, `registrationNumber`, `organization`, `partnership`.
+**IMPORTANTE**: NAO existe status "Liquidado" nem "Pendente" nas faturas.
 
-#### `cmu_energy_meter_bills` — Contas da Concessionaria (CEMIG/COELBA/etc)
-| Coluna | Tipo | Descricao |
+### `cmu_energy_meter_bills` — Contas da Concessionaria (~15.000)
+
+```sql
+CREATE TABLE cmu_energy_meter_bills (
+    id              INT PRIMARY KEY,  -- energyMeterBillID
+    energy_meter_id INT,              -- FK para cmu_energy_meters
+    data            JSONB NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Campos JSONB usados**:
+| Campo | Tipo | Uso |
 |---|---|---|
-| `id` | int PK | `energyMeterBillID` da API |
-| `energy_meter_id` | int FK | Vinculo com medidor |
-| `data` | jsonb | Payload completo da conta |
-| `updated_at` | timestamptz | |
+| `energyMeterBillID` | int | ID |
+| `energyMeterID` | int | FK medidor |
+| `referenceMonth` | string | Mes ref |
+| `totalAmount` | float | Valor da conta (R$) |
+| `energyBillFile` | string (URL) | PDF da conta |
+| `energyBalancePeakTime` | float | Saldo energia horario ponta (kWh) |
+| `energyBalanceOffPeakTime` | float | Saldo energia fora ponta (kWh) |
+| `consumedEnergyAmountOffPeakTime` | float | Consumo fora ponta |
+| `injectedEnergyAmountOffPeakTime` | float | Energia injetada pela usina |
 
-**Campos JSONB principais**: `energyMeterBillID`, `energyMeterID`, `referenceMonth`, `totalAmount` (valor concessionaria), `energyBillFile` (URL PDF), `energyMeterBillStatus`, `info` (texto completo da conta com tarifas, impostos, saldos), `consumedEnergyAmountOffPeakTime`, `consumedEnergyAmountPeakTime`, `injectedEnergyAmountOffPeakTime` (energia injetada pela usina), `icmsPercentage`, `cofinsPercentage`, `pisPercentage`, `availabilityCost`, `typefullLine` (codigo de barras), `pixCustomerCode`, `customerNumber`, `expirationDate`, `energyBalancePeakTime`, `energyBalanceOffPeakTime`.
+### `cmu_energy_meter_payments` — Pagamentos/Boletos (~14.000)
 
-#### `cmu_energy_meter_payments` — Pagamentos/Boletos (~14.000)
-| Coluna | Tipo | Descricao |
+```sql
+CREATE TABLE cmu_energy_meter_payments (
+    id              INT PRIMARY KEY,  -- energyMeterPaymentID
+    energy_meter_id INT,
+    data            JSONB NOT NULL,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ DEFAULT NOW()
+);
+```
+
+**Campos JSONB usados**:
+| Campo | Tipo | Uso |
 |---|---|---|
-| `id` | int PK | `energyMeterPaymentID` da API |
-| `energy_meter_id` | int FK | Vinculo com medidor |
-| `data` | jsonb | Payload completo do pagamento |
-| `updated_at` | timestamptz | |
+| `energyMeterPaymentID` | int | ID |
+| `energyMeterID` | int | FK medidor |
+| `energyMeterInvoiceID` | int | FK fatura |
+| `referenceMonth` | string | Mes ref |
+| `totalAmount` | float | Valor do boleto (R$) |
+| `paidAmount` | float | Valor efetivamente pago |
+| `paymentDate` | string | Data do pagamento |
+| `expirationDate` | string | Vencimento |
+| `energyMeterPaymentStatus` | string | **"Pago" / "Pendente" / "Vencido" / "Errado" / "Cancelado" / "Simulação"** |
+| `paymentLinkURL` | string (URL) | Link do boleto Iugu |
+| `paymentMethod` | string | Boleto/Cartao/PIX |
 
-**Campos JSONB principais**: `energyMeterPaymentID`, `energyMeterID`, `energyMeterInvoiceID` (vinculo com fatura), `referenceMonth`, `totalAmount`, `paidAmount`, `paymentDate`, `expirationDate`, `energyMeterPaymentStatus` (Pago/Pendente/Vencido/Errado/Cancelado/Simulação — NAO existe "Liquidado"), `paymentMethod` (Boleto/Cartao/PIX), `paymentLinkURL` (link Iugu), `bank` (IUGU), `registrationNumber`, `autoCancelAt`, `bankLiquidValue`, `paymentTicketBarCode`, `paymentTicketComment`.
+**IMPORTANTE**: NAO existe status "Liquidado" nos pagamentos. O correto eh "Pago".
 
-#### `cmu_contacts` — Contatos/Responsaveis (NOVO)
-| Coluna | Tipo | Descricao |
-|---|---|---|
-| `id` | int PK | `contactID` da API |
-| `data` | jsonb | Payload: name, function (Titular/Financeiro/Representante Legal), email, phone, comment (pode conter CPF e endereco) |
-| `updated_at` | timestamptz | |
+### `cmu_contacts` — Contatos/Responsaveis (~4.000)
 
-**Nota**: NAO tem vinculo direto com energyMeterID. Campo `responsibilitys` sempre vazio. Cruzamento possivel por CPF no `comment`.
+```sql
+CREATE TABLE cmu_contacts (
+    id          INT PRIMARY KEY,  -- contactID
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-#### `cmu_customers` — Perfis de Acesso/Grupos (NOVO)
-| Coluna | Tipo | Descricao |
-|---|---|---|
-| `id` | int PK | `userID` da API |
-| `data` | jsonb | Payload: name, role (Acesso), email, phone, accessCount, lastAccess |
-| `updated_at` | timestamptz | |
+Campos: `contactID`, `name`, `function` (Titular/Financeiro/Representante Legal), `email`, `phone`, `comment` (pode conter CPF).
+**NAO tem vinculo direto com energyMeterID.**
 
-**Vinculo**: EnergyMeter → `data.customer.userID` → Customer.id
+### `cmu_customers` — Perfis de Acesso
 
-#### `cmu_prospectors` — Parceiros Comerciais (NOVO)
-| Coluna | Tipo | Descricao |
-|---|---|---|
-| `id` | int PK | `userID` da API |
-| `data` | jsonb | Payload: name, alias, email, contactEmail, phone, parentID, ruleSetName, devolutiveEmail |
-| `updated_at` | timestamptz | |
+```sql
+CREATE TABLE cmu_customers (
+    id          INT PRIMARY KEY,  -- userID
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-**Vinculo**: EnergyMeter → `data.voucher.prospector.userID` → Prospector.id
+Vinculo: `EnergyMeter.data.customer.userID → Customer.id`
 
-#### `cmu_vouchers` — Cupons/Contratos (NOVO)
-| Coluna | Tipo | Descricao |
-|---|---|---|
-| `id` | int PK | `voucherID` da API |
-| `data` | jsonb | Payload: code, economyPercentage, economyFormula, commissionFormula, expirationDate, voucherType |
-| `updated_at` | timestamptz | |
+### `cmu_prospectors` — Parceiros Comerciais
 
-**Vinculo**: EnergyMeter → `data.voucherID` → Voucher.id
+```sql
+CREATE TABLE cmu_prospectors (
+    id          INT PRIMARY KEY,  -- userID
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-#### `sync_control` — Controle de paginacao e modo incremental
-| Coluna | Tipo | Descricao |
-|---|---|---|
-| `endpoint_name` | text PK | Nome do endpoint (todos os 8) |
-| `last_page_processed` | int | Ultima pagina sincronizada |
-| `last_sync_completed_at` | timestamptz | Timestamp do ultimo sync completo (usado para filtro incremental) |
-| `sync_mode` | text | Ultimo modo executado: 'full' ou 'incremental' |
-| `updated_at` | timestamptz | |
+Vinculo: `EnergyMeter.data.voucher.prospector.userID → Prospector.id`
 
-## API Endpoints (Backend Express)
+### `cmu_vouchers` — Cupons/Contratos
 
-### `GET /api/EnergyMeters`
-Listagem paginada com busca global. Query params:
-- `page`, `pageSize` — paginacao (default 1/25)
-- `filters` — JSON stringificado: `{ name, energyMeterStatus, pendingPayments }`
-- Busca `name` faz ILIKE em: `name`, `registrationNumber`, `meterNumber`, `customerNumber`
+```sql
+CREATE TABLE cmu_vouchers (
+    id          INT PRIMARY KEY,  -- voucherID
+    data        JSONB NOT NULL,
+    created_at  TIMESTAMPTZ DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-### `GET /api/EnergyMeterInvoices`
-Faturas de um medidor com JOIN nas bills. Query params:
-- `filters` — JSON: `{ energyMeterID }` (obrigatorio)
-- Retorna array com `energyMeterBill` embutido (para PDF da concessionaria)
+Vinculo: `EnergyMeter.data.voucherID → Voucher.id`
 
-### `GET /api/EnergyMeterPayments` (a implementar no server.js)
-Atualmente o frontend chama este endpoint mas ele nao existe no `server.js`. O `Clientes.jsx` faz `fetchApi('/EnergyMeterPayments?filters=...')` e trata o erro silenciosamente.
+### `sync_control` — Controle do Sync
 
-## Sync Service
+```sql
+CREATE TABLE sync_control (
+    endpoint_name          TEXT PRIMARY KEY,
+    last_page_processed    INT DEFAULT 1,
+    last_sync_completed_at TIMESTAMPTZ,
+    sync_mode              TEXT DEFAULT 'full',
+    updated_at             TIMESTAMPTZ DEFAULT NOW()
+);
+```
 
-### `sync_v2.js` (PRINCIPAL — usar este)
-- Sincroniza **8 endpoints** em 2 fases:
-  - Fase 1 (sem FK): EnergyMeters, Contacts, Customers, Prospectors, Vouchers
-  - Fase 2 (FK para meters): EnergyMeterBills, EnergyMeterInvoices, EnergyMeterPayments
-- **Modo incremental** (default): usa filtro `updatedAt>=` na API — so busca registros alterados desde ultimo sync. Testado e confirmado que a API suporta em todos os 4 endpoints grandes.
-- **Modo full** (`--full`): re-sync completo, reseta paginas no sync_control
-- Pode rodar um endpoint especifico: `--endpoint=NomeDoEndpoint`
-- Migration automatica: cria tabelas novas (`cmu_contacts`, `cmu_customers`, `cmu_prospectors`, `cmu_vouchers`) no primeiro run
-- Retry com backoff exponencial (5s, 10s, 20s, 40s, 80s — max 5 tentativas)
-- Graceful shutdown: Ctrl+C salva progresso e para limpo
-- Logs estruturados com timestamp `[ISO] [LEVEL] [ENDPOINT] msg`
-- **IMPORTANTE para proximo agente**: Se o sync nunca rodou full pelo v2, o modo incremental detecta e forca full automaticamente. Apos o primeiro full, incrementais subsequentes sao rapidos (poucos registros por dia).
+Endpoints registrados: EnergyMeters, Contacts, Customers, Prospectors, Vouchers, EnergyMeterBills, EnergyMeterInvoices, EnergyMeterPayments.
 
-### `sync_final.js` (legado v1)
-- Apenas 4 endpoints, sem incremental, sem Contacts/Customers/Prospectors/Vouchers
-- Mantido como referencia, usar sync_v2.js para novos syncs
+---
 
-### `sync.js` (legado v0)
-- Apenas 3 endpoints (sem payments), sem FK check
-- Bug: usa `https.Agent` sem importar o modulo `https`
-
-## Analytics (Frontend)
-
-Calculos feitos no `Clientes.jsx`:
-- **Consumo Medio**: media de `consumedEnergy` das faturas validas (exclui Cancelado/Reprovado)
-- **Eficiencia Usina**: `(compensatedEnergy / consumedEnergy) * 100` do ultimo mes
-- **Economia**: `discountEstimative` do medidor (% desconto fixo do contrato)
-- **Inadimplencia**: `expiredPaymentsTotalAmount` e `pendingPayments` do medidor
-- **Consumo vs Meta**: `((consumedEnergy / contractConsumption) - 1) * 100`
-
-## Relacoes entre Entidades
+## RELACOES ENTRE ENTIDADES
 
 ```
 EnergyMeter (UC/Cliente)
@@ -212,151 +269,394 @@ EnergyMeter (UC/Cliente)
   |
   |-- 1:N --> EnergyMeterPayment (Boleto/Pagamento)
   |               |
-  |               |-- N:1 --> EnergyMeterInvoice (vinculo via energyMeterInvoiceID)
+  |               |-- N:1 --> EnergyMeterInvoice (via energyMeterInvoiceID)
   |
   |-- N:1 --> Customer (data.customer.userID)
   |-- N:1 --> Voucher (data.voucherID)
                   |
                   |-- N:1 --> Prospector (voucher.prospector.userID)
 
-Contact (sem vinculo direto — cruzamento por CPF no campo comment)
+Contact (sem vinculo direto — cruzamento possivel por CPF no campo comment)
 ```
 
-- Um medidor tem multiplas faturas e pagamentos
-- Cada fatura Solatio referencia uma conta da concessionaria (`energyMeterBillID`)
-- Cada pagamento referencia uma fatura (`energyMeterInvoiceID`)
-- `referenceMonth` eh a chave logica de cruzamento temporal entre faturas, contas e pagamentos
-- Customers, Vouchers e Prospectors vinculam via IDs embutidos no JSONB do meter
-- Contacts NAO tem vinculo direto — possivel cruzamento por CPF no campo `comment`
+- `referenceMonth` eh a chave de cruzamento temporal entre faturas, contas e pagamentos
+- `energyMeterBillID` dentro da fatura vincula fatura ↔ conta concessionaria
 
-## Key Conventions
+---
 
-- Textos da UI e comentarios em **Portugues Brasileiro**
-- Formatacao monetaria: BRL com `Intl.NumberFormat('pt-BR')`
-- ESLint: `no-unused-vars` ignora variaveis que comecam com maiuscula ou underscore
-- Frontend: ES Modules (import/export); Backend: CommonJS (require)
-- Sem framework de testes configurado
-- Datas sempre em ISO 8601 com `T00:00:00`, referenceMonth sempre 1o dia do mes
+## QUERIES SQL QUE O FRONTEND USA (converter para Supabase)
 
-## API CMU — Endpoints Disponiveis
+Estas sao as queries exatas do `server.js` que devem virar chamadas Supabase (via `supabase.rpc()`, views, ou queries diretas).
 
-Ver `docs/API_AUDIT.md` para auditoria completa. Resumo:
-
-Endpoints **sincronizados** (sync_v2.js): EnergyMeters, EnergyMeterBills, EnergyMeterInvoices, EnergyMeterPayments, Contacts, Customers, Prospectors, Vouchers
-Endpoints **disponiveis mas nao sincronizados**: ProspectorAPI/Data (unificado, util para queries sob demanda), Queries/GetCustomerDebits/{cpf} (boletos em aberto por CPF)
-Endpoints **bloqueados**: Tickets (sem permissao), Leads (retorna vazio)
-
-**Dados que NAO existem em nenhum endpoint**: email pessoal do consumidor final, dados bancarios do consumidor (banco/agencia/conta), birthday.
-
-**Campos `emails` e `phones` no EnergyMeter**: existem no schema mas sao SEMPRE VAZIOS em toda a base. Dados de contato alternativos estao em `data.customer.email/phone` (do grupo) e no endpoint `Contacts` (responsaveis, sem vinculo direto com meter).
-
-## Roadmap / Pendencias Conhecidas
-
-- **Fallbacks no frontend**: usar `data.customer.phone` e endereco dos Payments quando meter tem dados vazios
-- **Novos endpoints no server.js**: expor dados das novas tabelas (Contacts, Customers, Prospectors, Vouchers) para o frontend
-- **Endpoint `/api/dados-rateio`**: Rateio.jsx chama este endpoint mas ele nao existe no server.js (precisa implementar)
-
-## Implementacoes Futuras — Migracao para Supabase
-
-> **IMPORTANTE PARA O PROXIMO AGENTE**: Esta secao descreve planos FUTUROS. O projeto atual roda com Neon Postgres + Express local. NAO tente implementar nada desta secao a menos que o usuario peca explicitamente.
-
-### Hospedagem planejada: Supabase
-
-O projeto sera migrado para o Supabase. A arquitetura futura:
-
-| Componente atual | Destino Supabase |
-|---|---|
-| Neon Postgres | Supabase Postgres (migracao direta, mesmo schema JSONB) |
-| Express API (server.js) | Supabase Edge Functions (Deno) OU manter Express em host separado (Railway/Render) |
-| sync_v2.js (cron) | **pg_cron** + Edge Function OU **Supabase Cron Jobs** (via Dashboard) |
-| Frontend (Vite SPA) | Vercel / Netlify / Supabase Hosting (static deploy) |
-
-### Cron para sync automatico no Supabase
-
-O Supabase oferece **3 opcoes** para agendar o sync incremental:
-
-#### Opcao 1: Supabase Cron Jobs (Recomendada)
-Supabase tem cron nativo via Dashboard (Database > Extensions > pg_cron). Pode chamar uma Edge Function via `net.http_post`:
+### 1. Listagem de Medidores (pagina Clientes)
 
 ```sql
--- Habilitar extensao (uma vez)
-CREATE EXTENSION IF NOT EXISTS pg_cron;
-CREATE EXTENSION IF NOT EXISTS pg_net;
+-- Busca paginada com busca global e filtro de status
+SELECT data FROM cmu_energy_meters
+WHERE 1=1
+  AND (data->>'name' ILIKE '%termo%' OR data->>'registrationNumber' ILIKE '%termo%'
+       OR data->>'meterNumber' ILIKE '%termo%' OR data->>'customerNumber' ILIKE '%termo%')
+  AND data->>'energyMeterStatus' = 'Ativa'  -- opcional
+ORDER BY data->>'name' ASC
+LIMIT 25 OFFSET 0;
 
--- Agendar sync diario as 3h da manha (UTC)
-SELECT cron.schedule(
-  'sync-cmu-daily',
-  '0 3 * * *',
-  $$SELECT net.http_post(
-    url := 'https://<project>.supabase.co/functions/v1/sync-cmu',
-    headers := '{"Authorization": "Bearer <service_role_key>"}'::jsonb
-  )$$
-);
+-- Contagem total (para paginacao)
+SELECT COUNT(*) FROM cmu_energy_meters WHERE ... (mesmos filtros);
 ```
 
-A Edge Function `sync-cmu` seria uma versao Deno do sync_v2.js (ou chamaria o sync Node.js hospedado externamente).
+**Retorna**: `{ data: [...medidores], total: int }`
 
-#### Opcao 2: GitHub Actions (mais simples, sem reescrever sync)
-Manter sync_v2.js como esta e rodar via GitHub Actions scheduled workflow:
+### 2. Faturas de um Medidor (modal do cliente)
 
-```yaml
-# .github/workflows/sync-cron.yml
-name: Sync CMU Daily
-on:
-  schedule:
-    - cron: '0 6 * * *'  # 3h BRT = 6h UTC
-  workflow_dispatch:       # permite rodar manualmente
-jobs:
-  sync:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: cd sync-service && npm ci && node sync_v2.js
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          CMU_API_BASE_URL: ${{ secrets.CMU_API_BASE_URL }}
-          CMU_API_TOKEN: ${{ secrets.CMU_API_TOKEN }}
+```sql
+SELECT
+  i.data as invoice_obj,
+  b.data as bill_obj
+FROM cmu_energy_meter_invoices i
+LEFT JOIN cmu_energy_meter_bills b
+  ON (i.data->>'energyMeterBillID')::int = b.id
+WHERE (i.data->>'energyMeterID')::int = $1
+ORDER BY (i.data->>'referenceMonth') DESC
 ```
 
-**Vantagem**: Nao precisa reescrever sync_v2.js. Funciona com Neon OU Supabase Postgres.
-
-#### Opcao 3: Host separado para o backend
-Hospedar `sync-service/` (Express + sync) em Railway, Render ou Fly.io. Configurar cron no proprio host (Railway tem cron jobs nativo). O frontend aponta para a URL publica da API.
-
-### Passos para migracao (quando for implementar)
-
-1. Criar projeto Supabase e obter connection string
-2. Rodar `sync_v2.js --full` apontando para o Supabase Postgres (trocar DATABASE_URL no .env)
-3. Decidir onde hospedar o server.js (Edge Functions vs host externo)
-4. Configurar cron (opcao 1, 2 ou 3 acima)
-5. Deploy do frontend (Vercel/Netlify com VITE_API_BASE_URL apontando para a nova API)
-6. Desativar Neon Postgres antigo
-
-## MUI v7 — Grid API
-
-**IMPORTANTE**: Este projeto usa MUI v7 (`@mui/material@^7.3.9`). A API do Grid mudou:
-
-```jsx
-// ERRADO (v5/v6 — NAO usar)
-<Grid item xs={12} md={6}>
-
-// CORRETO (v7 — Grid v2)
-<Grid size={{ xs: 12, md: 6 }}>
+**Pos-processamento no backend** (manter no frontend):
+```javascript
+const formattedData = result.rows.map(row => ({
+  ...row.invoice_obj,
+  energyMeterBill: row.bill_obj,
+  energyBalance: row.bill_obj
+    ? (parseFloat(row.bill_obj.energyBalanceOffPeakTime || 0) + parseFloat(row.bill_obj.energyBalancePeakTime || 0))
+    : null
+}));
 ```
 
-A prop `item` foi removida. Props de breakpoint (`xs`, `md`, `sm`, `lg`, `xl`) agora vao dentro de `size`. Sem `size`, o Grid nao distribui os itens e tudo fica comprimido na esquerda.
+### 3. Pagamentos de um Medidor (modal do cliente)
 
-## Notas para o Proximo Agente
+```sql
+SELECT p.data as payment_obj
+FROM cmu_energy_meter_payments p
+WHERE (p.data->>'energyMeterID')::int = $1
+ORDER BY (p.data->>'referenceMonth') DESC
+```
 
-- **sync_v2.js** eh o script principal de sync. Sempre use este, nao os legados.
-- Se precisar re-popular o banco do zero: `cd sync-service && node sync_v2.js --full` (demora ~2-3h pelos endpoints grandes)
-- Para sync rapido do dia: `node sync_v2.js` (sem flags) — usa filtro `updatedAt>=` e leva poucos minutos
-- O sync roda a migration automaticamente — nao precisa rodar o SQL manualmente
-- A API CMU base URL de producao eh `server.solatioenergialivre.com.br` (nao `dev-server`; o dev-server eh so para Swagger docs)
-- Token de autenticacao eh Bearer token no header Authorization
-- Documentacao detalhada da API em `docs/API_AUDIT.md`
-- Samples do banco em `docs/db-samples/` (JSONs exportados das tabelas)
-- **NAO implementar migracao Supabase** a menos que o usuario peca — ver secao "Implementacoes Futuras" acima
-- **Sempre usar `<Grid size={{}}>` no MUI v7**, nunca `<Grid item xs={}>`
+### 4. Dashboard Stats (13 queries em paralelo)
+
+**Queries sem filtro de periodo** (estado atual dos medidores):
+
+```sql
+-- Medidores por status
+SELECT data->>'energyMeterStatus' as status, COUNT(*)::int as count
+FROM cmu_energy_meters GROUP BY 1 ORDER BY 2 DESC;
+
+-- Inadimplencia
+SELECT COUNT(*)::int as count, COALESCE(SUM((data->>'expiredPaymentsTotalAmount')::numeric), 0) as total
+FROM cmu_energy_meters WHERE (data->>'expiredPaymentsTotalAmount')::numeric > 0;
+
+-- Medidores por estado
+SELECT data->>'addressState' as state, COUNT(*)::int as count
+FROM cmu_energy_meters WHERE data->>'addressState' IS NOT NULL GROUP BY 1 ORDER BY 2 DESC;
+
+-- Medidores por distribuidora
+SELECT data->'distributor'->>'alias' as distributor, COUNT(*)::int as count
+FROM cmu_energy_meters WHERE data->'distributor'->>'alias' IS NOT NULL GROUP BY 1 ORDER BY 2 DESC;
+
+-- Medidores por classe
+SELECT data->>'class' as class, COUNT(*)::int as count
+FROM cmu_energy_meters WHERE data->>'class' IS NOT NULL GROUP BY 1 ORDER BY 2 DESC;
+
+-- Top 10 parceiros
+SELECT data->'voucher'->'prospector'->>'name' as partner, COUNT(*)::int as count
+FROM cmu_energy_meters WHERE data->'voucher'->'prospector'->>'name' IS NOT NULL
+GROUP BY 1 ORDER BY 2 DESC LIMIT 10;
+```
+
+**Queries COM filtro de periodo** (`referenceMonth >= startDate AND referenceMonth <= endDate`):
+
+```sql
+-- Receita liquidada (pagamentos confirmados)
+SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0) as total
+FROM cmu_energy_meter_payments
+WHERE data->>'energyMeterPaymentStatus' = 'Pago'
+  AND data->>'referenceMonth' >= $1  -- startDate (opcional)
+  AND data->>'referenceMonth' <= $2; -- endDate (opcional)
+
+-- Faturas por status
+SELECT data->>'energyMeterInvoiceStatus' as status, COUNT(*)::int as count,
+       COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total
+FROM cmu_energy_meter_invoices
+WHERE data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Pagamentos por status
+SELECT data->>'energyMeterPaymentStatus' as status, COUNT(*)::int as count,
+       COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total
+FROM cmu_energy_meter_payments
+WHERE data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Faturamento mensal (grafico de barras)
+SELECT data->>'referenceMonth' as month,
+       COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as revenue,
+       COUNT(*)::int as invoice_count
+FROM cmu_energy_meter_invoices
+WHERE data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')
+  AND data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2
+GROUP BY 1 ORDER BY 1 DESC LIMIT 12;  -- LIMIT 12 so quando sem filtro de periodo
+
+-- Energia consumida/compensada
+SELECT COALESCE(SUM((data->>'consumedEnergy')::numeric), 0)::float as total_consumed,
+       COALESCE(SUM((data->>'compensatedEnergy')::numeric), 0)::float as total_compensated
+FROM cmu_energy_meter_invoices
+WHERE data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')
+  AND data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2;
+
+-- Economia gerada
+SELECT COALESCE(SUM((data->>'economyValue')::numeric), 0)::float as total_economy
+FROM cmu_energy_meter_invoices
+WHERE data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')
+  AND data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2;
+
+-- Custo concessionaria
+SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total_bills
+FROM cmu_energy_meter_bills
+WHERE data->>'referenceMonth' >= $1 AND data->>'referenceMonth' <= $2;
+```
+
+### 5. Inadimplentes (pagina Inadimplencia)
+
+```sql
+-- Listagem paginada ordenada por maior divida
+SELECT data FROM cmu_energy_meters
+WHERE (data->>'expiredPaymentsTotalAmount')::numeric > 0
+  AND (data->>'name' ILIKE '%termo%' OR data->>'meterNumber' ILIKE '%termo%'
+       OR data->>'registrationNumber' ILIKE '%termo%')  -- busca opcional
+ORDER BY (data->>'expiredPaymentsTotalAmount')::numeric DESC
+LIMIT 20 OFFSET 0;
+
+-- Agregados (KPIs)
+SELECT COUNT(*)::int as count,
+       COALESCE(SUM((data->>'expiredPaymentsTotalAmount')::numeric), 0)::float as total_amount,
+       COALESCE(SUM((data->>'pendingPayments')::int), 0)::int as total_pending
+FROM cmu_energy_meters
+WHERE (data->>'expiredPaymentsTotalAmount')::numeric > 0
+  AND ... (mesmos filtros);
+```
+
+---
+
+## FUNCIONALIDADES DO FRONTEND (replicar identicas)
+
+### Pagina: Dashboard (`/`)
+- 8 KPIs em 2 linhas de 4
+- Filtro de periodo (2 calendarios mes De/Ate, auto-apply)
+- Grafico de barras: Faturamento Mensal (12 meses)
+- Pizza: Medidores por Status
+- Pizza: Distribuicao por Estado
+- Pizza: Medidores por Distribuidora
+- Pizza: Classe de Consumo
+- Ranking: Top 10 Parceiros
+- Tabela: Faturas por Status
+- Tabela: Pagamentos por Status
+- Ver detalhes em `docs/DASHBOARD_FIELDS.md`
+
+### Pagina: Clientes (`/clientes`)
+- Tabela paginada server-side (DataGrid) com colunas: Instalacao, Cliente, Cidade, UF, Status, Inadimplente
+- Barra de busca (Nome, CPF, Instalacao) + filtro dropdown Status UC (Ativa/Desconectada/Cancelada)
+- Ao clicar numa linha abre **Modal fullscreen** com:
+  - 6 KPIs: Consumo Contratado, Consumo Medio, Eficiencia Usina, Economia, Saldo Energia, Inadimplente
+  - DataGrid de Faturas (historico completo) com colunas: Mes Ref, Consumo (kWh + % vs meta), Gerado (kWh), Saldo (kWh), Valor Solatio, Economia, Status Fatura, Status Pagamento, Docs (PDF fatura + PDF conta + link boleto)
+  - 4 cards informativos: Unidade, Localizacao, Contato, Contrato
+
+**Calculos no frontend** (nao vem do banco):
+- Consumo Medio = media de `consumedEnergy` das faturas validas
+- Eficiencia Usina = `(compensatedEnergy / consumedEnergy) * 100` do ultimo mes
+- Saldo Energia = `energyBalanceOffPeakTime + energyBalancePeakTime` da bill mais recente
+- Consumo vs Meta = `((consumedEnergy / contractConsumption) - 1) * 100`
+
+**Fallbacks de dados** (campos vazios no meter):
+- Email: tenta `emails` → `customer.email` → `voucher.prospector.contactEmail`
+- Telefone: tenta `phones` → `customer.phone` → `voucher.prospector.phone`
+- Endereco: tenta `address` → monta de `addressStreet + addressNumber + addressDistrict`
+
+### Pagina: Inadimplencia (`/inadimplencia`)
+- Barra de busca (Nome, CPF, Instalacao) + filtro periodo (De/Ate)
+- 4 KPIs: Total Inadimplente, Medidores Devedores, Boletos Pendentes, Ticket Medio
+- DataGrid paginada server-side: Cliente, Instalacao, UF, Cidade, Valor Vencido, Pendencias, Status UC, Parceiro, Organizacao
+
+### Pagina: Rateio (`/rateio`)
+- **NAO FUNCIONAL** — endpoint `/api/dados-rateio` nao existe
+- Pagina de distribuicao de clientes por usinas (mockada com 3 usinas fixas)
+- Se for reimplementar, precisa criar endpoint que retorne medidores com consumo medio
+
+### Layout
+- Sidebar fixa esquerda (230px) com navegacao: Dashboard, Clientes, Inadimplencia, Rateio
+- Tema escuro na sidebar (`#0d1b2a`), conteudo em `#f4f6f8`
+
+---
+
+## COMO CONECTAR O SUPABASE
+
+### 1. Criar tabelas no Supabase
+
+Rodar os CREATE TABLE acima no SQL Editor do Supabase. Sao 9 tabelas no total.
+
+### 2. Popular dados
+
+Trocar `DATABASE_URL` no `.env` para a connection string do Supabase Postgres e rodar:
+```bash
+cd sync-service && node sync_v2.js --full
+```
+
+Demora ~3-5h (8.000+ medidores, 20.000+ faturas, etc). O script cria as tabelas automaticamente se nao existirem.
+
+### 3. Frontend — instalar Supabase client
+
+```bash
+npm install @supabase/supabase-js
+```
+
+### 4. Configurar client
+
+```javascript
+import { createClient } from '@supabase/supabase-js'
+const supabase = createClient(
+  process.env.VITE_SUPABASE_URL,     // https://xxx.supabase.co
+  process.env.VITE_SUPABASE_ANON_KEY // anon key publica
+)
+```
+
+### 5. Converter queries
+
+**Opcao A — RPC functions** (recomendado para queries complexas como dashboard stats):
+
+Criar funcoes SQL no Supabase e chamar via `supabase.rpc('dashboard_stats', { start_date, end_date })`.
+
+**Opcao B — Queries diretas** (para CRUD simples):
+
+```javascript
+// Listar medidores paginados
+const { data, count } = await supabase
+  .from('cmu_energy_meters')
+  .select('data', { count: 'exact' })
+  .ilike('data->>name', `%${search}%`)
+  .order('data->>name')
+  .range(offset, offset + pageSize - 1)
+```
+
+**IMPORTANTE**: Queries com JOIN (faturas + bills), ILIKE em multiplos campos, ou agregacoes complexas sao melhor servidas por **RPC functions** (funcoes SQL no Supabase) do que pelo query builder.
+
+### 6. RLS (Row Level Security)
+
+Para este projeto, desabilitar RLS ou usar `service_role` key, ja que nao tem autenticacao de usuarios. Os dados sao read-only para o frontend.
+
+```sql
+ALTER TABLE cmu_energy_meters ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "allow_read" ON cmu_energy_meters FOR SELECT USING (true);
+-- Repetir para todas as tabelas
+```
+
+---
+
+## ENVIRONMENT VARIABLES
+
+### Atual (.env na raiz)
+```
+DATABASE_URL=postgresql://...          # Neon Postgres (trocar para Supabase)
+VITE_API_BASE_URL=https://server.solatioenergialivre.com.br
+VITE_API_TOKEN=Bearer_token_aqui
+CMU_API_BASE_URL=https://server.solatioenergialivre.com.br
+CMU_API_TOKEN=Bearer_token_aqui
+```
+
+### Apos migracao — adicionar:
+```
+VITE_SUPABASE_URL=https://xxx.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJ...
+DATABASE_URL=postgresql://postgres:senha@db.xxx.supabase.co:5432/postgres
+```
+
+---
+
+## SYNC SERVICE (manter como esta)
+
+`sync-service/sync_v2.js` — script Node.js que puxa dados da API CMU para o Postgres.
+
+- **8 endpoints** em 2 fases (fase 1: entidades independentes, fase 2: dependentes de meter)
+- Modo incremental (default): filtra por `updatedAt>=` na API — so busca alteracoes
+- Modo full (`--full`): re-sync completo
+- Endpoint especifico: `--endpoint=NomeDoEndpoint`
+- Retry com backoff exponencial (5 tentativas)
+- Graceful shutdown com Ctrl+C
+
+Para popular o Supabase do zero: `cd sync-service && node sync_v2.js --full`
+
+Para cron automatico no Supabase, ver opcoes:
+1. **pg_cron + Edge Function** — nativo do Supabase
+2. **GitHub Actions** — `node sync_v2.js` em workflow scheduled
+3. **Host separado** (Railway/Render) com cron nativo
+
+---
+
+## COMMANDS (desenvolvimento atual)
+
+```bash
+# Frontend
+npm install && npm run dev       # Vite dev server
+
+# Backend (SERA SUBSTITUIDO pelo Supabase client)
+cd sync-service && npm install
+node server.js                   # Express :3001
+
+# Sync
+cd sync-service
+node sync_v2.js                  # Incremental
+node sync_v2.js --full           # Full re-sync
+```
+
+---
+
+## CONVENCOES
+
+- Textos da UI em **Portugues Brasileiro**
+- Formatacao monetaria: BRL `Intl.NumberFormat('pt-BR')`
+- Datas ISO 8601, `referenceMonth` sempre 1o dia do mes
+- Frontend: ES Modules. Sync service: CommonJS.
+- **MUI v7**: usar `<Grid size={{ xs: 12, md: 6 }}>`, NUNCA `<Grid item xs={12}>`
+- **MUI X DataGrid v8**: paginacao server-side com `paginationMode="server"`
+- Status configs para badges: ver `statusConfigs` em `src/components/shared.jsx`
+
+---
+
+## ARQUIVOS RELEVANTES
+
+| Arquivo | O que faz |
+|---|---|
+| `src/App.jsx` | Router com 4 rotas + Layout |
+| `src/components/Layout.jsx` | Sidebar + area de conteudo |
+| `src/components/shared.jsx` | KPICard, StatusBadge, PeriodFilter, DataField, InfoCard, formatters |
+| `src/pages/Dashboard.jsx` | Dashboard com KPIs, graficos e tabelas |
+| `src/pages/Clientes.jsx` | Listagem + modal detalhado do cliente |
+| `src/pages/Inadimplencia.jsx` | Inadimplentes com busca e KPIs |
+| `src/pages/Rateio.jsx` | Rateio (nao funcional) |
+| `src/api/api.js` | `fetchApi()` — wrapper do fetch para Express |
+| `sync-service/server.js` | **Express API (5 rotas) — SUBSTITUIR pelo Supabase** |
+| `sync-service/sync_v2.js` | Script de sync — MANTER |
+| `docs/DASHBOARD_FIELDS.md` | Documentacao de cada metrica do dashboard |
+| `docs/API_AUDIT.md` | Auditoria completa da API CMU |
+| `docs/db-samples/` | Amostras JSON de cada tabela |
+
+---
+
+## CHECKLIST DE MIGRACAO
+
+- [ ] Criar projeto Supabase
+- [ ] Criar as 9 tabelas (SQL acima)
+- [ ] Configurar RLS (allow read)
+- [ ] Rodar `sync_v2.js --full` com `DATABASE_URL` do Supabase
+- [ ] Instalar `@supabase/supabase-js` no frontend
+- [ ] Criar Supabase RPC functions para queries complexas (dashboard stats, faturas+bills join)
+- [ ] Substituir `fetchApi()` por chamadas Supabase em cada pagina
+- [ ] Testar todas as funcionalidades
+- [ ] Configurar cron para sync automatico
+- [ ] Deploy frontend (Vercel/Netlify)
+- [ ] Remover `server.js` e dependencia do Express
