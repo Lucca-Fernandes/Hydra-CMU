@@ -114,6 +114,22 @@ export const PeriodFilter = ({ onApply, extraFilters }) => {
   );
 };
 
+export const PlaceholderCard = ({ title, source, description }) => (
+  <Card variant="outlined" sx={{ borderRadius: '12px', border: '2px dashed #ccc', bgcolor: '#fafafa', height: '100%' }}>
+    <CardContent sx={{ p: 3, textAlign: 'center' }}>
+      <Typography variant="subtitle1" fontWeight="700" color="text.secondary">{title}</Typography>
+      <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.5 }}>
+        Aguardando integracao com {source}
+      </Typography>
+      {description && (
+        <Typography variant="caption" color="text.disabled" sx={{ display: 'block', mt: 0.5, fontStyle: 'italic' }}>
+          {description}
+        </Typography>
+      )}
+    </CardContent>
+  </Card>
+);
+
 export const DataField = ({ label, value }) => (
   <Grid size={12}>
     <Typography variant="caption" color="text.secondary" sx={{ fontWeight: '700', textTransform: 'uppercase', fontSize: '0.6rem', display: 'block' }}>{label}</Typography>

@@ -1,17 +1,21 @@
 import { Box, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography, Divider } from '@mui/material';
 import DashboardIcon from '@mui/icons-material/Dashboard';
+import AttachMoneyIcon from '@mui/icons-material/AttachMoney';
+import BoltIcon from '@mui/icons-material/Bolt';
 import PeopleIcon from '@mui/icons-material/People';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
-import HubIcon from '@mui/icons-material/Hub';
+import SyncIcon from '@mui/icons-material/Sync';
 import { useNavigate, useLocation } from 'react-router-dom';
 
 const DRAWER_WIDTH = 230;
 
 const navItems = [
   { label: 'Dashboard', path: '/', icon: <DashboardIcon /> },
+  { label: 'Financeiro', path: '/financeiro', icon: <AttachMoneyIcon /> },
+  { label: 'Energia', path: '/energia', icon: <BoltIcon /> },
   { label: 'Clientes', path: '/clientes', icon: <PeopleIcon /> },
   { label: 'Inadimplência', path: '/inadimplencia', icon: <WarningAmberIcon /> },
-  { label: 'Rateio', path: '/rateio', icon: <HubIcon /> },
+  { label: 'Sync Logs', path: '/sync', icon: <SyncIcon /> },
 ];
 
 export default function Layout({ children }) {

@@ -117,6 +117,8 @@ app.get('/api/EnergyMeterPayments', async (req, res) => {
 });
 
 let statsCache = { data: null, timestamp: 0, key: '' };
+let financialCache = { data: null, timestamp: 0, key: '' };
+let energyCache = { data: null, timestamp: 0, key: '' };
 const CACHE_TTL = 5 * 60 * 1000;
 
 app.get('/api/dashboard/stats', async (req, res) => {
@@ -215,6 +217,218 @@ app.get('/api/dashboard/stats', async (req, res) => {
   }
 });
 
+// ============================================================
+// FINANCIAL STATS (RF04)
+// ============================================================
+
+app.get('/api/financial/stats', async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const cacheKey = `fin_${startDate || ''}_${endDate || ''}`;
+
+    if (financialCache.data && financialCache.key === cacheKey && (Date.now() - financialCache.timestamp) < CACHE_TTL) {
+      return res.json(financialCache.data);
+    }
+
+    let dateFilterInv = `data->>'energyMeterInvoiceStatus' = 'Faturado'`;
+    let dateFilterPay = `data->>'energyMeterPaymentStatus' NOT IN ('Errado','Cancelado','Simulação')`;
+    const params = [];
+
+    if (startDate) {
+      params.push(startDate);
+      dateFilterInv += ` AND data->>'referenceMonth' >= $${params.length}`;
+      dateFilterPay += ` AND data->>'referenceMonth' >= $${params.length}`;
+    }
+    if (endDate) {
+      params.push(endDate);
+      dateFilterInv += ` AND data->>'referenceMonth' <= $${params.length}`;
+      dateFilterPay += ` AND data->>'referenceMonth' <= $${params.length}`;
+    }
+
+    const [
+      faturamentoResult, receitaResult, inadResult, abertoResult,
+      monthlyPayResult, monthlyInvResult, payStatusResult, invStatusResult
+    ] = await Promise.all([
+      pool.query(`SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total FROM cmu_energy_meter_invoices WHERE ${dateFilterInv}`, params),
+      pool.query(`SELECT COALESCE(SUM(COALESCE(NULLIF(data->>'paidAmount','')::numeric, (data->>'totalAmount')::numeric)), 0)::float as total, COUNT(*)::int as count FROM cmu_energy_meter_payments WHERE data->>'energyMeterPaymentStatus' = 'Pago' AND ${dateFilterPay}`, params),
+      pool.query(`SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total FROM cmu_energy_meter_payments WHERE data->>'energyMeterPaymentStatus' = 'Vencido' AND ${dateFilterPay}`, params),
+      pool.query(`SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total FROM cmu_energy_meter_payments WHERE data->>'energyMeterPaymentStatus' = 'Pendente' AND ${dateFilterPay}`, params),
+      pool.query(`
+        SELECT data->>'referenceMonth' as month,
+          COALESCE(SUM(CASE WHEN data->>'energyMeterPaymentStatus' = 'Pago' THEN COALESCE(NULLIF(data->>'paidAmount','')::numeric, (data->>'totalAmount')::numeric) ELSE 0 END), 0)::float as recebido,
+          COALESCE(SUM(CASE WHEN data->>'energyMeterPaymentStatus' = 'Vencido' THEN (data->>'totalAmount')::numeric ELSE 0 END), 0)::float as vencido,
+          COALESCE(SUM(CASE WHEN data->>'energyMeterPaymentStatus' = 'Pendente' THEN (data->>'totalAmount')::numeric ELSE 0 END), 0)::float as pendente
+        FROM cmu_energy_meter_payments WHERE ${dateFilterPay}
+        GROUP BY 1 ORDER BY 1 DESC ${!startDate && !endDate ? 'LIMIT 12' : ''}
+      `, params),
+      pool.query(`
+        SELECT data->>'referenceMonth' as month,
+          COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as faturado
+        FROM cmu_energy_meter_invoices WHERE ${dateFilterInv}
+        GROUP BY 1 ORDER BY 1 DESC ${!startDate && !endDate ? 'LIMIT 12' : ''}
+      `, params),
+      pool.query(`
+        SELECT data->>'energyMeterPaymentStatus' as status, COUNT(*)::int as count,
+          COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total
+        FROM cmu_energy_meter_payments WHERE ${dateFilterPay}
+        GROUP BY 1 ORDER BY 2 DESC
+      `, params),
+      pool.query(`
+        SELECT data->>'energyMeterInvoiceStatus' as status, COUNT(*)::int as count,
+          COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total
+        FROM cmu_energy_meter_invoices
+        WHERE data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')
+          ${startDate ? `AND data->>'referenceMonth' >= $1` : ''}
+          ${endDate ? `AND data->>'referenceMonth' <= $${startDate ? 2 : 1}` : ''}
+        GROUP BY 1 ORDER BY 2 DESC
+      `, params),
+    ]);
+
+    const faturamento = faturamentoResult.rows[0].total;
+    const receita = receitaResult.rows[0].total;
+    const receitaCount = receitaResult.rows[0].count;
+
+    const invByMonth = {};
+    monthlyInvResult.rows.forEach(r => { invByMonth[r.month] = r.faturado; });
+
+    const allMonths = new Set([
+      ...monthlyPayResult.rows.map(r => r.month),
+      ...monthlyInvResult.rows.map(r => r.month)
+    ]);
+
+    const monthlyFlow = Array.from(allMonths).sort().map(month => {
+      const pay = monthlyPayResult.rows.find(r => r.month === month) || { recebido: 0, vencido: 0, pendente: 0 };
+      const fat = invByMonth[month] || 0;
+      return { month, faturado: fat, recebido: pay.recebido, vencido: pay.vencido, pendente: pay.pendente };
+    });
+
+    const stats = {
+      faturamento,
+      receita,
+      receitaCount,
+      inadimplencia: inadResult.rows[0].total,
+      emAberto: abertoResult.rows[0].total,
+      taxaRecebimento: faturamento > 0 ? (receita / faturamento) * 100 : 0,
+      ticketMedio: receitaCount > 0 ? receita / receitaCount : 0,
+      monthlyFlow,
+      paymentsByStatus: payStatusResult.rows,
+      invoicesByStatus: invStatusResult.rows,
+    };
+
+    financialCache = { data: stats, timestamp: Date.now(), key: cacheKey };
+    res.json(stats);
+  } catch (err) {
+    console.error('Erro em /financial/stats:', err);
+    res.status(500).json({ error: 'Erro ao calcular estatisticas financeiras' });
+  }
+});
+
+// ============================================================
+// ENERGY STATS (RF01/RF03)
+// ============================================================
+
+app.get('/api/energy/stats', async (req, res) => {
+  try {
+    const { startDate, endDate } = req.query;
+    const cacheKey = `eng_${startDate || ''}_${endDate || ''}`;
+
+    if (energyCache.data && energyCache.key === cacheKey && (Date.now() - energyCache.timestamp) < CACHE_TTL) {
+      return res.json(energyCache.data);
+    }
+
+    let invFilter = `data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')`;
+    let billFilter = `1=1`;
+    const params = [];
+
+    if (startDate) {
+      params.push(startDate);
+      invFilter += ` AND data->>'referenceMonth' >= $${params.length}`;
+      billFilter += ` AND data->>'referenceMonth' >= $${params.length}`;
+    }
+    if (endDate) {
+      params.push(endDate);
+      invFilter += ` AND data->>'referenceMonth' <= $${params.length}`;
+      billFilter += ` AND data->>'referenceMonth' <= $${params.length}`;
+    }
+
+    const [
+      energyTotals, billsCost, saldoResult,
+      monthlyEnergy, monthlyBills, consumoByDist
+    ] = await Promise.all([
+      pool.query(`
+        SELECT COALESCE(SUM((data->>'consumedEnergy')::numeric), 0)::float as consumed,
+               COALESCE(SUM((data->>'compensatedEnergy')::numeric), 0)::float as compensated,
+               COALESCE(SUM((data->>'economyValue')::numeric), 0)::float as economy
+        FROM cmu_energy_meter_invoices WHERE ${invFilter}
+      `, params),
+      pool.query(`SELECT COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as total FROM cmu_energy_meter_bills WHERE ${billFilter}`, params),
+      pool.query(`
+        SELECT COALESCE(SUM(saldo), 0)::float as total FROM (
+          SELECT DISTINCT ON ((data->>'energyMeterID')::int)
+            COALESCE(NULLIF(data->>'energyBalanceOffPeakTime','')::numeric, 0) +
+            COALESCE(NULLIF(data->>'energyBalancePeakTime','')::numeric, 0) as saldo
+          FROM cmu_energy_meter_bills
+          ORDER BY (data->>'energyMeterID')::int, data->>'referenceMonth' DESC
+        ) sub
+      `),
+      pool.query(`
+        SELECT data->>'referenceMonth' as month,
+          COALESCE(SUM((data->>'consumedEnergy')::numeric), 0)::float as consumed,
+          COALESCE(SUM((data->>'compensatedEnergy')::numeric), 0)::float as compensated,
+          COALESCE(SUM((data->>'economyValue')::numeric), 0)::float as economy
+        FROM cmu_energy_meter_invoices WHERE ${invFilter}
+        GROUP BY 1 ORDER BY 1 DESC ${!startDate && !endDate ? 'LIMIT 12' : ''}
+      `, params),
+      pool.query(`
+        SELECT data->>'referenceMonth' as month,
+          COALESCE(SUM((data->>'totalAmount')::numeric), 0)::float as cost
+        FROM cmu_energy_meter_bills WHERE ${billFilter}
+        GROUP BY 1 ORDER BY 1 DESC ${!startDate && !endDate ? 'LIMIT 12' : ''}
+      `, params),
+      pool.query(`
+        SELECT m.data->'distributor'->>'alias' as distributor,
+          COALESCE(SUM((i.data->>'consumedEnergy')::numeric), 0)::float as consumed
+        FROM cmu_energy_meter_invoices i
+        JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int = m.id
+        WHERE i.data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado','Reprovado')
+          ${startDate ? `AND i.data->>'referenceMonth' >= $1` : ''}
+          ${endDate ? `AND i.data->>'referenceMonth' <= $${startDate ? 2 : 1}` : ''}
+        GROUP BY 1 ORDER BY 2 DESC
+      `, params),
+    ]);
+
+    const en = energyTotals.rows[0];
+    const billsByMonth = {};
+    monthlyBills.rows.forEach(r => { billsByMonth[r.month] = r.cost; });
+
+    const monthlyData = monthlyEnergy.rows.reverse().map(r => ({
+      month: r.month,
+      consumed: r.consumed,
+      compensated: r.compensated,
+      efficiency: r.consumed > 0 ? (r.compensated / r.consumed) * 100 : 0,
+      economy: r.economy,
+      billsCost: billsByMonth[r.month] || 0,
+    }));
+
+    const stats = {
+      consumed: en.consumed,
+      compensated: en.compensated,
+      efficiency: en.consumed > 0 ? (en.compensated / en.consumed) * 100 : 0,
+      saldoTotal: saldoResult.rows[0].total,
+      economy: en.economy,
+      billsCost: billsCost.rows[0].total,
+      monthlyEnergy: monthlyData,
+      consumoByDistributor: consumoByDist.rows,
+    };
+
+    energyCache = { data: stats, timestamp: Date.now(), key: cacheKey };
+    res.json(stats);
+  } catch (err) {
+    console.error('Erro em /energy/stats:', err);
+    res.status(500).json({ error: 'Erro ao calcular estatisticas de energia' });
+  }
+});
+
 app.get('/api/EnergyMeters/delinquent', async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -269,6 +483,436 @@ app.get('/api/EnergyMeters/delinquent', async (req, res) => {
   } catch (err) {
     console.error("Erro em /EnergyMeters/delinquent:", err);
     res.status(500).json({ error: "Erro ao buscar inadimplentes" });
+  }
+});
+
+const initRateioTables = async () => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS rateio_plants (
+      id SERIAL PRIMARY KEY,
+      name TEXT NOT NULL,
+      base_capacity NUMERIC NOT NULL DEFAULT 744000,
+      default_factor NUMERIC DEFAULT 0,
+      active BOOLEAN DEFAULT true,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS rateio_snapshots (
+      id SERIAL PRIMARY KEY,
+      reference_month DATE NOT NULL UNIQUE,
+      total_generation_kwh NUMERIC,
+      total_ucs INT,
+      calculated_at TIMESTAMPTZ DEFAULT NOW(),
+      status TEXT DEFAULT 'rascunho'
+    );
+    CREATE TABLE IF NOT EXISTS rateio_generation (
+      id SERIAL PRIMARY KEY,
+      plant_id INT REFERENCES rateio_plants(id) ON DELETE CASCADE,
+      snapshot_id INT REFERENCES rateio_snapshots(id) ON DELETE CASCADE,
+      factor NUMERIC NOT NULL DEFAULT 1.0,
+      generated_kwh NUMERIC,
+      UNIQUE(plant_id, snapshot_id)
+    );
+    CREATE TABLE IF NOT EXISTS rateio_results (
+      id SERIAL PRIMARY KEY,
+      snapshot_id INT REFERENCES rateio_snapshots(id) ON DELETE CASCADE,
+      energy_meter_id INT NOT NULL,
+      meter_name TEXT,
+      meter_number TEXT,
+      class_priority TEXT,
+      consumo_medio NUMERIC DEFAULT 0,
+      consumo_override NUMERIC,
+      saldo_anterior NUMERIC DEFAULT 0,
+      need_kwh NUMERIC DEFAULT 0,
+      allocation_pct NUMERIC DEFAULT 0,
+      allocated_kwh NUMERIC DEFAULT 0,
+      saldo_previsto NUMERIC DEFAULT 0,
+      meses_saldo NUMERIC DEFAULT 0,
+      UNIQUE(snapshot_id, energy_meter_id)
+    );
+  `);
+
+  await pool.query(`ALTER TABLE rateio_plants ADD COLUMN IF NOT EXISTS default_factor NUMERIC DEFAULT 0`);
+
+  const existing = await pool.query('SELECT COUNT(*)::int as c FROM rateio_plants');
+  if (parseInt(existing.rows[0].c) === 0) {
+    const seed = [
+      ['Mandaguari', 744000, 0.6],
+      ['Alto Furnas', 744000, 0.8],
+      ['Alto Furnas II', 744000, 0],
+      ['Chica II (Sao Felix II)', 744000, 1.6],
+      ['Bom Retiro II', 744000, 1.5],
+      ['Bom Retiro III', 744000, 0],
+      ['Carangola I', 744000, 1.7],
+      ['Carangola II', 744000, 0],
+      ['Santa Cruz', 744000, 0.62],
+      ['Chica III', 744000, 0],
+      ['Talisma', 744000, 0],
+      ['Olhos d\'agua', 744000, 0],
+      ['Sao Felix', 744000, 0.7],
+      ['Para de Minas', 744000, 0.22],
+      ['Japaraiba', 744000, 0.25],
+      ['UFV Araguari', 744000, 0.2],
+      ['Bom Retiro IV', 744000, 0],
+      ['Centro Oeste', 744000, 0.7],
+      ['Raul Soares', 744000, 0.9],
+      ['Sao Joao del Rei', 744000, 0.5],
+      ['Raul Soares II', 744000, 0],
+      ['Planura', 744000, 1.0],
+      ['Bom Retiro I', 730000, 0.5],
+      ['Chica I', 730000, 0.57],
+      ['Nova Uniao', 730000, 0.18],
+      ['Cedro', 730000, 0.57],
+      ['UFV Carangola', 672000, 0.67],
+      ['Bom Jesus', 730000, 0.15],
+      ['Ponte Queimada', 730000, 0.2],
+      ['Santa Barbara', 730000, 0.35],
+      ['Divino', 730000, 0.4],
+      ['Faria Lemos', 730000, 0.4],
+    ];
+    for (const [name, cap, factor] of seed) {
+      await pool.query(
+        'INSERT INTO rateio_plants (name, base_capacity, default_factor) VALUES ($1, $2, $3)',
+        [name, cap, factor]
+      );
+    }
+    console.log(`Seed: ${seed.length} usinas inseridas`);
+  }
+};
+initRateioTables().catch(err => console.error('Erro ao criar tabelas rateio:', err));
+
+app.get('/api/rateio/plants', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM rateio_plants WHERE active = true ORDER BY name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar usinas' });
+  }
+});
+
+app.post('/api/rateio/plants', async (req, res) => {
+  try {
+    const { name, base_capacity } = req.body;
+    const result = await pool.query(
+      'INSERT INTO rateio_plants (name, base_capacity) VALUES ($1, $2) RETURNING *',
+      [name, base_capacity || 648000]
+    );
+    res.json(result.rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao adicionar usina' });
+  }
+});
+
+app.delete('/api/rateio/plants/:id', async (req, res) => {
+  try {
+    await pool.query('UPDATE rateio_plants SET active = false WHERE id = $1', [req.params.id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao remover usina' });
+  }
+});
+
+app.get('/api/rateio/snapshots', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM rateio_snapshots ORDER BY reference_month DESC');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar snapshots' });
+  }
+});
+
+app.post('/api/rateio/calculate', async (req, res) => {
+  const { reference_month, plant_factors } = req.body;
+  try {
+    const plantsResult = await pool.query('SELECT * FROM rateio_plants WHERE active = true');
+    const plants = plantsResult.rows;
+    const factorMap = {};
+    (plant_factors || []).forEach(pf => { factorMap[pf.plant_id] = parseFloat(pf.factor) || 0; });
+
+    let totalGeneration = 0;
+    const generationData = plants.map(p => {
+      const factor = factorMap[p.id] || 0;
+      const generated = parseFloat(p.base_capacity) * factor;
+      totalGeneration += generated;
+      return { plant_id: p.id, factor, generated_kwh: generated };
+    });
+
+    const metersResult = await pool.query(`
+      SELECT id, data->>'name' as name, data->>'meterNumber' as meter_number,
+             COALESCE(NULLIF(data->>'contractConsumption','')::numeric, 0) as contract_consumption
+      FROM cmu_energy_meters WHERE data->>'energyMeterStatus' = 'Ativa'
+    `);
+    const meters = metersResult.rows;
+
+    const refDate = new Date(reference_month);
+    const threeBack = new Date(refDate);
+    threeBack.setMonth(threeBack.getMonth() - 3);
+    const startMonth = threeBack.toISOString().split('T')[0] + 'T00:00:00';
+    const endMonth = refDate.toISOString().split('T')[0] + 'T00:00:00';
+
+    const consumoResult = await pool.query(`
+      SELECT (data->>'energyMeterID')::int as meter_id,
+             AVG(COALESCE(NULLIF(data->>'consumedEnergy','')::numeric, 0)) as avg_consumed
+      FROM cmu_energy_meter_invoices
+      WHERE data->>'energyMeterInvoiceStatus' NOT IN ('Cancelado', 'Reprovado')
+        AND data->>'referenceMonth' >= $1 AND data->>'referenceMonth' < $2
+      GROUP BY 1
+    `, [startMonth, endMonth]);
+    const consumoMap = {};
+    consumoResult.rows.forEach(r => { consumoMap[r.meter_id] = parseFloat(r.avg_consumed); });
+
+    const saldoResult = await pool.query(`
+      SELECT DISTINCT ON ((data->>'energyMeterID')::int)
+        (data->>'energyMeterID')::int as meter_id,
+        COALESCE(NULLIF(data->>'energyBalanceOffPeakTime','')::numeric, 0) +
+        COALESCE(NULLIF(data->>'energyBalancePeakTime','')::numeric, 0) as saldo
+      FROM cmu_energy_meter_bills
+      WHERE data->>'referenceMonth' < $1
+      ORDER BY (data->>'energyMeterID')::int, data->>'referenceMonth' DESC
+    `, [endMonth]);
+    const saldoMap = {};
+    saldoResult.rows.forEach(r => { saldoMap[r.meter_id] = parseFloat(r.saldo); });
+
+    const results = [];
+    let totalNeed = 0;
+
+    meters.forEach(m => {
+      const consumo = consumoMap[m.id] || parseFloat(m.contract_consumption) || 0;
+      const saldo = saldoMap[m.id] || 0;
+      const need = Math.max(consumo - saldo, 0);
+      totalNeed += need;
+
+      let cls = 'D';
+      if (consumo > 10000) cls = 'AA';
+      else if (consumo > 5000) cls = 'A';
+      else if (consumo > 1000) cls = 'B';
+      else if (consumo > 500) cls = 'C';
+
+      results.push({
+        energy_meter_id: m.id, meter_name: m.name, meter_number: m.meter_number,
+        class_priority: cls, consumo_medio: consumo, saldo_anterior: saldo, need_kwh: need,
+      });
+    });
+
+    results.forEach(r => {
+      r.allocation_pct = totalNeed > 0 ? r.need_kwh / totalNeed : 0;
+      r.allocated_kwh = r.allocation_pct * totalGeneration;
+      r.saldo_previsto = r.saldo_anterior + r.allocated_kwh - r.consumo_medio;
+      r.meses_saldo = r.consumo_medio > 0 ? r.saldo_previsto / r.consumo_medio : 0;
+    });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      const snapResult = await client.query(`
+        INSERT INTO rateio_snapshots (reference_month, total_generation_kwh, total_ucs)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (reference_month) DO UPDATE SET
+          total_generation_kwh = $2, total_ucs = $3, calculated_at = NOW()
+        RETURNING id
+      `, [reference_month, totalGeneration, results.length]);
+      const snapshotId = snapResult.rows[0].id;
+
+      await client.query('DELETE FROM rateio_generation WHERE snapshot_id = $1', [snapshotId]);
+      await client.query('DELETE FROM rateio_results WHERE snapshot_id = $1', [snapshotId]);
+
+      for (const g of generationData) {
+        await client.query(
+          'INSERT INTO rateio_generation (plant_id, snapshot_id, factor, generated_kwh) VALUES ($1, $2, $3, $4)',
+          [g.plant_id, snapshotId, g.factor, g.generated_kwh]
+        );
+      }
+
+      const BATCH = 200;
+      for (let i = 0; i < results.length; i += BATCH) {
+        const batch = results.slice(i, i + BATCH);
+        const values = [];
+        const placeholders = batch.map((r, j) => {
+          const b = j * 12;
+          values.push(snapshotId, r.energy_meter_id, r.meter_name, r.meter_number, r.class_priority,
+            r.consumo_medio, r.saldo_anterior, r.need_kwh, r.allocation_pct, r.allocated_kwh,
+            r.saldo_previsto, r.meses_saldo);
+          return `($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10},$${b+11},$${b+12})`;
+        });
+        await client.query(`
+          INSERT INTO rateio_results (snapshot_id, energy_meter_id, meter_name, meter_number, class_priority,
+            consumo_medio, saldo_anterior, need_kwh, allocation_pct, allocated_kwh, saldo_previsto, meses_saldo)
+          VALUES ${placeholders.join(',')}
+        `, values);
+      }
+
+      await client.query('COMMIT');
+      res.json({ snapshot_id: snapshotId, total_generation: totalGeneration, total_ucs: results.length, total_need: totalNeed });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } catch (err) {
+    console.error('Erro em /rateio/calculate:', err.message, err.stack);
+    res.status(500).json({ error: 'Erro ao calcular rateio', detail: err.message });
+  }
+});
+
+app.get('/api/rateio/results/:month', async (req, res) => {
+  try {
+    const { month } = req.params;
+    const page = parseInt(req.query.page) || 1;
+    const pageSize = parseInt(req.query.pageSize) || 50;
+    const offset = (page - 1) * pageSize;
+    const search = req.query.search || '';
+    const classFilter = req.query.class || '';
+
+    const snap = await pool.query(
+      'SELECT id, total_generation_kwh, total_ucs, status FROM rateio_snapshots WHERE reference_month = $1', [month]
+    );
+    if (snap.rows.length === 0) return res.json({ data: [], total: 0, snapshot: null });
+
+    const snapshotId = snap.rows[0].id;
+    let where = 'snapshot_id = $1';
+    const params = [snapshotId];
+
+    if (search) {
+      params.push(`%${search}%`);
+      where += ` AND (meter_name ILIKE $${params.length} OR meter_number ILIKE $${params.length})`;
+    }
+    if (classFilter) {
+      params.push(classFilter);
+      where += ` AND class_priority = $${params.length}`;
+    }
+
+    const [results, countResult, aggResult] = await Promise.all([
+      pool.query(`SELECT * FROM rateio_results WHERE ${where} ORDER BY allocated_kwh DESC LIMIT ${pageSize} OFFSET ${offset}`, params),
+      pool.query(`SELECT COUNT(*)::int as count FROM rateio_results WHERE ${where}`, params),
+      pool.query(`
+        SELECT SUM(need_kwh)::float as total_need, SUM(allocated_kwh)::float as total_allocated,
+               AVG(allocation_pct)::float as avg_pct, AVG(meses_saldo)::float as avg_meses
+        FROM rateio_results WHERE snapshot_id = $1
+      `, [snapshotId])
+    ]);
+
+    const genResult = await pool.query(
+      `SELECT g.*, p.name as plant_name, p.base_capacity FROM rateio_generation g
+       JOIN rateio_plants p ON g.plant_id = p.id WHERE g.snapshot_id = $1 ORDER BY p.name`,
+      [snapshotId]
+    );
+
+    res.json({
+      data: results.rows,
+      total: countResult.rows[0].count,
+      snapshot: snap.rows[0],
+      generation: genResult.rows,
+      aggregate: aggResult.rows[0],
+    });
+  } catch (err) {
+    console.error('Erro em /rateio/results:', err);
+    res.status(500).json({ error: 'Erro ao buscar resultados' });
+  }
+});
+
+app.patch('/api/rateio/results/:id', async (req, res) => {
+  try {
+    const { consumo_override } = req.body;
+    const { id } = req.params;
+
+    const row = await pool.query('SELECT snapshot_id FROM rateio_results WHERE id = $1', [id]);
+    if (row.rows.length === 0) return res.status(404).json({ error: 'Resultado nao encontrado' });
+    const snapshotId = row.rows[0].snapshot_id;
+
+    await pool.query('UPDATE rateio_results SET consumo_override = $1 WHERE id = $2', [consumo_override, id]);
+
+    const snapResult = await pool.query('SELECT total_generation_kwh FROM rateio_snapshots WHERE id = $1', [snapshotId]);
+    const totalGen = parseFloat(snapResult.rows[0].total_generation_kwh);
+
+    await pool.query(`
+      WITH effective AS (
+        SELECT id, COALESCE(consumo_override, consumo_medio) as consumo, saldo_anterior
+        FROM rateio_results WHERE snapshot_id = $1
+      ),
+      needs AS (
+        SELECT id, consumo, saldo_anterior,
+          GREATEST(consumo - saldo_anterior, 0) as need,
+          CASE WHEN consumo > 10000 THEN 'AA' WHEN consumo > 5000 THEN 'A'
+               WHEN consumo > 1000 THEN 'B' WHEN consumo > 500 THEN 'C' ELSE 'D' END as cls
+        FROM effective
+      ),
+      totals AS (SELECT SUM(need) as total_need FROM needs),
+      calc AS (
+        SELECT n.id, n.cls,  n.need,
+          CASE WHEN t.total_need > 0 THEN n.need / t.total_need ELSE 0 END as pct,
+          CASE WHEN t.total_need > 0 THEN (n.need / t.total_need) * $2 ELSE 0 END as alloc,
+          n.saldo_anterior + (CASE WHEN t.total_need > 0 THEN (n.need / t.total_need) * $2 ELSE 0 END) - n.consumo as saldo_prev,
+          CASE WHEN n.consumo > 0 THEN
+            (n.saldo_anterior + (CASE WHEN t.total_need > 0 THEN (n.need / t.total_need) * $2 ELSE 0 END) - n.consumo) / n.consumo
+          ELSE 0 END as meses
+        FROM needs n, totals t
+      )
+      UPDATE rateio_results r SET
+        class_priority = c.cls, need_kwh = c.need, allocation_pct = c.pct,
+        allocated_kwh = c.alloc, saldo_previsto = c.saldo_prev, meses_saldo = c.meses
+      FROM calc c WHERE r.id = c.id
+    `, [snapshotId, totalGen]);
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('Erro em PATCH /rateio/results:', err);
+    res.status(500).json({ error: 'Erro ao atualizar resultado' });
+  }
+});
+
+// ============================================================
+// SYNC LOGS API
+// ============================================================
+
+app.get('/api/sync/runs', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const result = await pool.query(
+      'SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT $1', [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar execuções' });
+  }
+});
+
+app.get('/api/sync/runs/:id/logs', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM sync_logs WHERE run_id = $1 ORDER BY created_at ASC', [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar logs' });
+  }
+});
+
+app.get('/api/sync/control', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM sync_control ORDER BY endpoint_name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar sync_control' });
+  }
+});
+
+app.get('/api/sync/logs/recent', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const level = req.query.level;
+    let query = 'SELECT * FROM sync_logs';
+    const params = [];
+    if (level) {
+      params.push(level);
+      query += ' WHERE level = $1';
+    }
+    query += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1);
+    params.push(limit);
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar logs recentes' });
   }
 });
 
