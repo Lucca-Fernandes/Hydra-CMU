@@ -2,13 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## MISSAO DO PROXIMO AGENTE
+## AVISO — ESCOPO DE TRABALHO
 
-**Migrar este projeto de Neon Postgres + Express local para Supabase + novo frontend.**
+**NAO faca a migracao para Supabase a menos que o usuario peca explicitamente.**
+A secao "MIGRACAO FUTURA PARA SUPABASE" mais abaixo descreve um plano de longo prazo que **so deve ser executado quando o usuario pedir de forma clara** ("migra pra Supabase agora", "comeca a migracao", etc). Ate la, o stack atual permanece em uso: **Neon Postgres + Express local + React SPA**. Nao troque `DATABASE_URL`, nao instale `@supabase/supabase-js`, nao substitua `fetchApi()` por chamadas Supabase e nao mexa no RLS sem instrucao explicita.
 
-O backend atual (Express em `sync-service/server.js`) sera substituido pelo **Supabase client (`@supabase/supabase-js`)** chamando diretamente o Postgres do Supabase. O frontend sera refeito em outro padrao mas com **funcionalidades identicas** as atuais.
-
-O sync de dados (`sync-service/sync_v2.js`) continuara rodando como script Node.js, apenas apontando o `DATABASE_URL` para o Supabase Postgres.
+Em resumo: **o que esta funcionando hoje continua — so mude o stack quando for uma instrucao direta**.
 
 ---
 
@@ -494,6 +493,167 @@ WHERE (data->>'expiredPaymentsTotalAmount')::numeric > 0
 
 ---
 
+## INTEGRACAO UAU ERP (Globaltec / Grupo GVS)
+
+A UAU e a segunda fonte de dados do projeto (complementar ao CMU). Integrada em **abril/2026**. Este bloco e autoritativo — se o agente do futuro precisar mexer com UAU, leia tudo aqui antes de chutar endpoints.
+
+### O que e o UAU
+
+**UAU ERP** = sistema de gestao da **Globaltec** usado pelo **Grupo GVS** (holding parceira da Solatio). Contem dados financeiros, planejamento de obras, empresas/SPEs e processos de pagamento das usinas hidroeletricas (CGHs). Acessado via REST API em `https://api.grupogvs.com.br/uauAPI/api/v1.0/{Controller}/{Method}` (sempre POST).
+
+### Autenticacao (IMPORTANTE — 2 fatores)
+
+O UAU exige **dois headers de autenticacao simultaneamente** em toda chamada:
+
+1. `X-INTEGRATION-Authorization: <token fixo>` — token de integracao permanente, vem da Globaltec, vive no `.env` como `UAU_INTEGRATION_TOKEN`.
+2. `Authorization: <token do usuario>` — **SEM prefixo `Bearer`!** Token dinamico obtido via `POST /api/v1.0/Autenticador/AutenticarUsuario` com body `{Login, Senha}` + o `X-INTEGRATION-Authorization`. Expira em ~1h.
+
+O `server.js` ja tem tudo isso implementado em `getUauUserToken()` (cache de 50min) e `uauCall()` (retry automatico em 401 forcando novo login). **Nao reimplemente** — use as funcoes existentes.
+
+**Body minimo**: mesmo endpoints sem parametros exigem `{}` no POST. IIS rejeita Content-Length 0. Ja tratado em `uauCall()`.
+
+### Endpoints validados (testados ao vivo em 2026-04-14)
+
+**Tudo o que nao esta nesta lista nao existe ou nao foi testado.** A API do UAU nao tem documentacao publica e o servidor retorna 404 generico para controllers desconhecidos — nao da pra fazer discovery por introspec.
+
+#### OK — funcionam sem parametros
+
+| Controller | Method | Retorna |
+|---|---|---|
+| `Empresa` | `ObterEmpresasAtivas` | Array de 322 SPEs. Campos: `Codigo_emp`, `Desc_emp`, `CGC_emp`, `IE_emp`, `InscrMunic_emp`, `Endereco_emp`, `Fone_emp`. |
+| `Obras` | `ObterObrasAtivas` | Array de 1429 obras. Campos: `Cod_obr`, `Empresa_obr`, `Descr_obr`, `Status_obr` (0=normal/ativa efetivamente, 1/2/4=outros), `Ender_obr`, `Fone_obr`, `Fisc_obr`, `DtIni_obr`, `Dtfim_obr`, `TipoObra_obr`, `EnderEntr_obr`, `CEI_obr`, `DataCad_obr`, `DataAlt_obr`, `UsrCad_obr`. **ATENCAO**: `Status_obr=0` NAO significa inativa — a maioria das obras com dados esta em status 0. Nao filtre por status. |
+| `Autenticador` | `AutenticarUsuario` | `{Token, ...}`. Usado internamente pelo `getUauUserToken()`. |
+
+#### PARAMS — existem mas exigem body
+
+| Controller.Method | Body obrigatorio | Notas |
+|---|---|---|
+| `Planejamento.ConsultarDesembolsoPlanejamento` | `{Empresa: int, Obra: string, MesInicial: "mm/yyyy", MesFinal: "mm/yyyy"}` | Retorna linhas-item de desembolso planejado. Ver secao "Schema do desembolso" abaixo. |
+| `Medicao.ConsultarMedicao` | `{empresa: int, contrato: int, medicao: int}` | Consulta uma medicao especifica. **Nao serve pra listagem** — e pra buscar detalhes de uma medicao conhecida. |
+
+#### SLOW — endpoint existe mas da timeout (>3min mesmo com filtros)
+
+| Controller.Method | Status |
+|---|---|
+| `ProcessoPagamento.ConsultarProcessos` | Timeout mesmo com `{Empresa, Obra}`. Provavelmente o servidor UAU esta processando sincronamente um volume enorme. **Nao use ate a Globaltec corrigir.** |
+| `ProcessoPagamento.ConsultarProcessosPagamento` | Retorna 400 "Erro na verificacao do token" — parece exigir um header diferente. Investigar com a Globaltec. |
+
+#### MISSING — retornam 404, nao existem no UAU
+
+Os seguintes endpoints estavam chutados no primeiro catalogo, **foram testados e nao existem** — nao tente de novo:
+
+`Pessoas.ObterPessoas`, `Localidade.ObterLocalidades`, `Recebiveis.ConsultarRecebiveis`, `ExtratoDoCliente.ObterExtratoDoCliente`, `BoletoServices.ObterBoletoPorTitulo`, `CobrancaPix.ObterCobrancaPix`, `CessaoRecebiveis.ObterCessoes`, `Venda.ObterVendasPorEmpresa`, `NotasFiscais.ConsultarNotasFiscais`, `Fiscal.ObterImpostos`, `Contabil.ConsultarLancamentos`, `Planejamento.ConsultarCurvaFisicoFinanceira`, `Financeiro.ObterTitulos`, `Titulos.ConsultarTitulos`, `TituloReceber.ConsultarTitulos`, `TituloPagar.ConsultarTitulos`, `NotaFiscal.*`, `Cliente.*`, `Fornecedor.*`, `Banco.*`, `ContaCorrente.*`, `CentroCusto.*`, `Movimento.*`, `ContasReceber.*`, `ContasPagar.*`, `Contrato.*`, `Proposta.*`, `OrdemCompra.*`, `Insumos.*`, `Produto.*`, `Composicao.*`, `Cheque.*`, `Nota.*`, `Relatorio.*`, `RH.*`, `Funcionario.*`, `Usuarios.*`, `Obras.ObterObraPorCodigo`, `Obras.ObterObrasPorEmpresa`, `Empresa.ObterEmpresa`.
+
+**Para descobrir novos endpoints: peca a lista oficial a Globaltec/Grupo GVS.** Tentativa-e-erro nao funciona — a API retorna 404 anonimo.
+
+### Schema do `Planejamento.ConsultarDesembolsoPlanejamento`
+
+Este e o endpoint principal da integracao UAU hoje. Retorna **uma linha por combinacao (Obra, Item, Composicao, Insumo, DtaRef)** — e basicamente a curva fisico-financeira quebrada por insumo.
+
+**Campos retornados**:
+
+| Campo | Tipo | Significado |
+|---|---|---|
+| `Status` | string | **"Projetado"** (planejamento fisico — Total e QUANTIDADE, nao R$) / **"Pagar"** (compromisso futuro em R$) / **"Pago"** (desembolso ja realizado em R$) |
+| `Empresa` | int | Codigo da SPE (mesmo do `Codigo_emp`) |
+| `Obra` | string | Codigo da obra (mesmo do `Cod_obr`) |
+| `Contrato` | int | Numero do contrato dentro da obra |
+| `Produto` | int | Id do produto no UAU |
+| `Composicao` | string | Codigo da composicao (ex: "S206") |
+| `Item` | string | Item do cronograma (ex: "01.01") |
+| `Insumo` | string | Codigo do insumo (ex: "CI001") |
+| `DtaRef` | string ISO | Primeiro dia do mes de referencia |
+| `DtaRefMes` | int | Mes (redundante) |
+| `DtaRefAno` | int | Ano (redundante) |
+| `Total` | float | **Depende do Status** — em "Projetado" e quantidade fisica, em "Pago"/"Pagar" e valor monetario |
+| `Acrescimo` | float | Acrescimos em R$ (so em Pago/Pagar) |
+| `Desconto` | float | Descontos em R$ |
+| `TotalLiq` | float | **Valor liquido em R$** = TotalBruto + Acrescimo - Desconto. **Esta e a metrica monetaria correta para gestao de caixa.** |
+| `TotalBruto` | float | Valor bruto em R$ |
+
+**Armadilha critica**: NAO some `Total` como valor monetario geral. Para Status=Projetado, `Total` e quantidade de insumo (1 saco de cimento, 3 horas de mao de obra, etc). Somar tudo junto gera numeros astronomicos sem sentido (vimos R$ 420 bilhoes para Empresa 1). **Para metricas financeiras use `TotalLiq` ou `TotalBruto`** e/ou filtre por `Status IN ('Pago','Pagar')`.
+
+**Volume**: o export completo (janela 01/2010 → 12/2030, 1429 obras, 1212 com dados) gerou **1.934.131 linhas** = ~292MB CSV / ~164MB XLSX.
+
+### Rotas do backend (`sync-service/server.js`)
+
+Todas as rotas UAU estao no bloco comentado `UAU ERP (Globaltec / Grupo GVS) — Proxy Routes`. Helpers internos:
+
+- `getUauUserToken({force})` — autentica, cacheia token por 50min
+- `uauCall(controller, method, body, {retryOn401, timeout})` — wrapper de POST com 2FA, retry em 401, timeout configuravel (default 60s)
+- `getObrasCached()` — cache de 5min do `ObterObrasAtivas`
+- `uauErrorPayload(err)` — formata erro pra resposta HTTP
+
+Rotas HTTP expostas:
+
+| Metodo | Path | Descricao |
+|---|---|---|
+| GET | `/api/uau/status` | Health check — tenta autenticar e retorna `{connected, baseUrl, user, tokenPreview, tokenExpiresAt}` |
+| POST | `/api/uau/auth/refresh` | Forca novo token |
+| GET | `/api/uau/empresas` | Proxy direto para `Empresa.ObterEmpresasAtivas`, retorna `{count, items}` |
+| GET | `/api/uau/obras` | Proxy direto para `Obras.ObterObrasAtivas`, retorna `{count, items}` |
+| POST | `/api/uau/call` | Proxy generico. Body: `{controller, method, body, timeout?}`. Usado pelo Explorer da pagina UauApi. |
+| POST | `/api/uau/desembolso/empresa` | **Agregacao por empresa**. Body: `{empresa, mesInicial, mesFinal}`. Itera todas as obras da empresa (concorrencia 6), chama `Planejamento.ConsultarDesembolsoPlanejamento` pra cada, devolve `{totais, porMes, porStatus, topObras, topItens, rows, errors}`. Metricas somam **TotalLiq** (nao `Total`). |
+| GET | `/api/uau/catalog` | Catalogo estatico documentando os RFs e o status (`ok`/`params`/`slow`/`missing`) de cada endpoint, com body sugerido. Consumido pela pagina UauApi. |
+
+### Frontend — paginas UAU
+
+**`src/pages/UauApi.jsx`** (`/uau-api`) — explorador da API:
+- StatusCard mostrando conexao, user, token preview, expiracao
+- KPIs: Empresas ativas, Obras ativas
+- 4 abas: Catalogo G-Sentinel 2, Empresas (DataGrid), Explorer (controller+method+body arbitrarios), Obras (DataGrid)
+- Cards do catalogo tem chip colorido por status (`ok`/`params`/`slow`/`missing`), botao "Testar" desabilitado para missing, e pre-preenche o Explorer com o body sugerido
+- `JsonViewer` com botao copiar para inspecionar respostas
+
+**`src/pages/GestaoDesembolso.jsx`** (`/gestao-desembolso`) — dashboard de gestao:
+- Autocomplete de empresa (`Codigo_emp` + `Desc_emp`) carregada de `/api/uau/empresas`
+- Inputs `MesInicial` / `MesFinal` no formato `mm/yyyy`
+- Chama `/api/uau/desembolso/empresa` ao clicar Carregar
+- 4 KPIs: Planejado Liquido, Planejado Bruto, Acrescimos - Descontos, Obras com dados
+- BarChart (Recharts): Bruto vs Liquido por mes
+- PieChart: distribuicao por Status (dominado por Pago/Pagar; Projetado = R$ 0 porque sua coluna Total nao e dinheiro)
+- Top 10 obras por valor liquido
+- Top 10 itens/composicoes por valor liquido
+- DataGrid com todas as linhas brutas (ate 1 pagina de 50 por default)
+- Alert laranja quando alguma obra falha ao consultar
+
+### Scripts auxiliares (`sync-service/`)
+
+**`export_desembolso.js`** — Baixa **TUDO** do endpoint Planejamento. Autentica, busca obras, itera 1429 obras com concorrencia 6, janela `01/2010` → `12/2030`, agrega tudo em um CSV enriquecido (cada linha ganha `_ObraDescricao`, `_ObraStatus`, `_ObraTipo`, `_ObraDtIni`, `_ObraDtFim`). Saida: `desembolso_planejamento_<timestamp>.csv` na raiz do projeto. Leva ~5-10min. Rodar com: `cd sync-service && node export_desembolso.js`.
+
+**`csv_to_xlsx.js`** — Converte o CSV gigante em XLSX com **multiplas abas de ate 1M linhas cada** (limite do Excel). Usa `exceljs` em modo streaming para evitar OOM com 2M linhas. Parser CSV estadual que lida corretamente com `\n` embutido em campos quotados. Uso: `node csv_to_xlsx.js <caminho.csv>`. Output: mesmo nome com extensao `.xlsx`.
+
+**IMPORTANTE**: os arquivos de saida (`desembolso_planejamento_*.csv` e `.xlsx`) estao no `.gitignore` — nao commitar (292MB/164MB).
+
+### Environment variables UAU
+
+No `.env` da raiz:
+```
+UAU_BASE_URL=https://api.grupogvs.com.br/uauAPI
+UAU_INTEGRATION_TOKEN=<token fixo de integracao>
+UAU_USER=<usuario>
+UAU_PASS=<senha>
+```
+
+### Armadilhas / Gotchas
+
+1. **Total nao e sempre R$**: vale repetir — so some `TotalLiq`/`TotalBruto` para gestao financeira. `Total` mistura quantidades e valores dependendo do `Status`.
+2. **Status_obr=0 e normal**: a maior parte das obras ativas tem `Status_obr=0`. Nao use este campo como filtro de "ativa" — use a presenca no `ObterObrasAtivas` como indicativo.
+3. **Discovery de endpoint novo e caro**: se precisar de um endpoint nao listado aqui, **peca a lista oficial a Globaltec**. Nao gaste tokens tentando chutar.
+4. **Data format**: `MesInicial`/`MesFinal` em `ConsultarDesembolsoPlanejamento` e `mm/yyyy` (com barra). Se passar `yyyy-mm` o servidor responde "O mes inicial deve ser do tipo numerico e estar no formato mm/yyyy".
+5. **IIS exige body**: POSTs com `Content-Length: 0` sao rejeitados. Sempre envie `{}` no minimo.
+6. **Token sem "Bearer"**: Ponto critico — o header `Authorization` leva o token cru, sem `Bearer `. Se colocar Bearer, o UAU retorna 401.
+7. **Timeout grande**: `ProcessoPagamento.ConsultarProcessos` e lento. Nao aumente timeout geral — use o parametro `timeout` do `uauCall()` caso a caso.
+8. **Cache de 50min**: o token UAU expira em ~1h. O cache em `uauTokenCache` e proativo (50min). Se um 401 ainda ocorrer, `uauCall` refaz login automatico uma vez.
+
+---
+
+## MIGRACAO FUTURA PARA SUPABASE (**so executar quando pedido**)
+
+As secoes abaixo ("COMO CONECTAR O SUPABASE", "ENVIRONMENT VARIABLES — Apos migracao", "CHECKLIST DE MIGRACAO") descrevem o trabalho de migracao. **Nao execute nada disso por iniciativa propria.** Aguarde instrucao direta do usuario antes de mexer nessa parte. Se estiver em duvida, pergunte antes.
+
+---
+
 ## COMO CONECTAR O SUPABASE
 
 ### 1. Criar tabelas no Supabase
@@ -638,10 +798,15 @@ node sync_v2.js --full           # Full re-sync
 | `src/pages/Clientes.jsx` | Listagem + modal detalhado do cliente |
 | `src/pages/Inadimplencia.jsx` | Inadimplentes com busca e KPIs |
 | `src/pages/Rateio.jsx` | Rateio (nao funcional) |
-| `src/api/api.js` | `fetchApi()` — wrapper do fetch para Express |
-| `sync-service/server.js` | **Express API (5 rotas) — SUBSTITUIR pelo Supabase** |
-| `sync-service/sync_v2.js` | Script de sync — MANTER |
-| `docs/DASHBOARD_FIELDS.md` | Documentacao de cada metrica do dashboard |
+| `src/pages/SyncLogs.jsx` | Monitoramento dos logs do sync_v2 |
+| `src/pages/UauApi.jsx` | Explorer da API UAU — catalogo, Explorer generico, listagem de empresas/obras |
+| `src/pages/GestaoDesembolso.jsx` | Dashboard de gestao de desembolso planejado por empresa (UAU) |
+| `src/api/api.js` | `fetchApi()` + `BASE_URL` — wrapper do fetch para Express |
+| `sync-service/server.js` | Express API (rotas CMU + UAU). Bloco UAU comeca em `UAU ERP (Globaltec / Grupo GVS) — Proxy Routes` |
+| `sync-service/sync_v2.js` | Script de sync CMU — MANTER |
+| `sync-service/export_desembolso.js` | Dump completo do `Planejamento.ConsultarDesembolsoPlanejamento` para CSV |
+| `sync-service/csv_to_xlsx.js` | Converte CSV gigante em XLSX multi-aba (streaming via exceljs) |
+| `docs/DASHBOARD_FIELDS.md` | Documentacao de cada metrica do dashboard CMU |
 | `docs/API_AUDIT.md` | Auditoria completa da API CMU |
 | `docs/db-samples/` | Amostras JSON de cada tabela |
 
