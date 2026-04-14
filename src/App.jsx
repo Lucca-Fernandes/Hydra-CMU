@@ -8,6 +8,7 @@ import Clientes from './pages/Clientes';
 import Inadimplencia from './pages/Inadimplencia';
 import SyncLogs from './pages/SyncLogs';
 import UauApi from './pages/UauApi';
+import GestaoDesembolso from './pages/GestaoDesembolso';
 
 const theme = createTheme({
   palette: {
@@ -28,6 +29,7 @@ function App() {
             <Route path="/clientes" element={<Clientes />} />
             <Route path="/inadimplencia" element={<Inadimplencia />} />
             <Route path="/uau-api" element={<UauApi />} />
+            <Route path="/gestao-desembolso" element={<GestaoDesembolso />} />
             <Route path="/sync" element={<SyncLogs />} />
           </Routes>
         </Layout>

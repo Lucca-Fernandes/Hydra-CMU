@@ -6,6 +6,7 @@ import PeopleIcon from '@mui/icons-material/People';
 import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import SyncIcon from '@mui/icons-material/Sync';
 import ApiIcon from '@mui/icons-material/Api';
+import InsightsIcon from '@mui/icons-material/Insights';
 import { useNavigate, useLocation } from 'react-router-dom';
 
 const DRAWER_WIDTH = 230;
@@ -17,6 +18,7 @@ const navItems = [
   { label: 'Clientes', path: '/clientes', icon: <PeopleIcon /> },
   { label: 'Inadimplência', path: '/inadimplencia', icon: <WarningAmberIcon /> },
   { label: 'UAU API', path: '/uau-api', icon: <ApiIcon /> },
+  { label: 'Gestão Desembolso', path: '/gestao-desembolso', icon: <InsightsIcon /> },
   { label: 'Sync Logs', path: '/sync', icon: <SyncIcon /> },
 ];
 
