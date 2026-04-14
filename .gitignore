@@ -40,3 +40,8 @@ sync-service/sync_final.js
 
 # Screenshots in docs
 docs/*.png
+
+# Desembolso export outputs
+desembolso_planejamento_*.csv
+desembolso_planejamento_*.xlsx
+
