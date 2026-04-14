@@ -916,6 +916,340 @@ app.get('/api/sync/logs/recent', async (req, res) => {
   }
 });
 
+// ============================================================
+// UAU ERP (Globaltec / Grupo GVS) — Proxy Routes
+// ============================================================
+// Autenticacao de 2 fatores:
+//   1. X-INTEGRATION-Authorization: token de integracao (fixo no .env)
+//   2. Authorization: <token do usuario>  (SEM prefixo Bearer!)
+// Token de usuario: obtido via POST /api/v1.0/Autenticador/AutenticarUsuario
+// Corpo minimo obrigatorio em POSTs: {}  (IIS exige Content-Length)
+// ============================================================
+
+const axios = require('axios');
+
+const UAU_BASE_URL = process.env.UAU_BASE_URL;
+const UAU_INTEGRATION_TOKEN = process.env.UAU_INTEGRATION_TOKEN;
+const UAU_USER = process.env.UAU_USER;
+const UAU_PASS = process.env.UAU_PASS;
+
+let uauTokenCache = { token: null, expiresAt: 0 };
+const UAU_TOKEN_TTL_MS = 50 * 60 * 1000; // 50 min (UAU expira em ~1h)
+
+async function getUauUserToken({ force = false } = {}) {
+  if (!force && uauTokenCache.token && Date.now() < uauTokenCache.expiresAt) {
+    return uauTokenCache.token;
+  }
+  if (!UAU_BASE_URL || !UAU_INTEGRATION_TOKEN || !UAU_USER || !UAU_PASS) {
+    throw new Error('Variaveis UAU_* nao configuradas no .env');
+  }
+  const url = `${UAU_BASE_URL}/api/v1.0/Autenticador/AutenticarUsuario`;
+  const { data } = await axios.post(
+    url,
+    { Login: UAU_USER, Senha: UAU_PASS },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
+      },
+      timeout: 30000,
+    }
+  );
+  const token = data?.Token || data?.token || data?.AccessToken || data;
+  if (!token || typeof token !== 'string') {
+    throw new Error('Resposta de autenticacao UAU nao retornou token reconhecivel');
+  }
+  uauTokenCache = { token, expiresAt: Date.now() + UAU_TOKEN_TTL_MS };
+  return token;
+}
+
+async function uauCall(controller, method, body = {}, { retryOn401 = true, timeout = 60000 } = {}) {
+  const token = await getUauUserToken();
+  const url = `${UAU_BASE_URL}/api/v1.0/${controller}/${method}`;
+  try {
+    const { data } = await axios.post(url, body || {}, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
+        'Authorization': token,
+      },
+      timeout,
+    });
+    return data;
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 401 && retryOn401) {
+      await getUauUserToken({ force: true });
+      return uauCall(controller, method, body, { retryOn401: false });
+    }
+    throw err;
+  }
+}
+
+function uauErrorPayload(err) {
+  return {
+    error: err.message,
+    status: err.response?.status,
+    data: err.response?.data,
+  };
+}
+
+// --- Health / status da conexao ---
+app.get('/api/uau/status', async (req, res) => {
+  try {
+    const token = await getUauUserToken();
+    res.json({
+      connected: true,
+      baseUrl: UAU_BASE_URL,
+      user: UAU_USER,
+      tokenPreview: token.slice(0, 24) + '...',
+      tokenExpiresAt: new Date(uauTokenCache.expiresAt).toISOString(),
+      cachedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ connected: false, ...uauErrorPayload(err) });
+  }
+});
+
+// --- Forca refresh do token ---
+app.post('/api/uau/auth/refresh', async (req, res) => {
+  try {
+    const token = await getUauUserToken({ force: true });
+    res.json({ ok: true, tokenPreview: token.slice(0, 24) + '...' });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Empresas ativas (SPEs das usinas GVS) ---
+app.get('/api/uau/empresas', async (req, res) => {
+  try {
+    const data = await uauCall('Empresa', 'ObterEmpresasAtivas', {});
+    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Obras ativas ---
+app.get('/api/uau/obras', async (req, res) => {
+  try {
+    const data = await uauCall('Obras', 'ObterObrasAtivas', {});
+    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Cache simples de obras (5 min) para nao bater o UAU a cada consulta ---
+let obrasCache = { data: null, expiresAt: 0 };
+async function getObrasCached() {
+  if (obrasCache.data && Date.now() < obrasCache.expiresAt) return obrasCache.data;
+  const data = await uauCall('Obras', 'ObterObrasAtivas', {});
+  obrasCache = { data, expiresAt: Date.now() + 5 * 60 * 1000 };
+  return data;
+}
+
+// --- Desembolso agregado por empresa ---
+// Body: { empresa: int, mesInicial: "mm/yyyy", mesFinal: "mm/yyyy" }
+// Percorre todas as obras da empresa, chama Planejamento.ConsultarDesembolsoPlanejamento,
+// agrega e devolve KPIs + series prontas para o grafico + rows brutas.
+app.post('/api/uau/desembolso/empresa', async (req, res) => {
+  const { empresa, mesInicial, mesFinal } = req.body || {};
+  if (!empresa || !mesInicial || !mesFinal) {
+    return res.status(400).json({ error: 'empresa, mesInicial e mesFinal sao obrigatorios' });
+  }
+  const empCode = Number(empresa);
+  if (!Number.isFinite(empCode) || empCode <= 0) {
+    return res.status(400).json({ error: 'empresa deve ser um numero positivo' });
+  }
+  try {
+    const obras = await getObrasCached();
+    const obrasDaEmpresa = obras.filter(o => Number(o.Empresa_obr) === empCode);
+    if (obrasDaEmpresa.length === 0) {
+      return res.json({
+        empresa: empCode, mesInicial, mesFinal,
+        obrasTotal: 0, obrasComDados: 0, linhasTotal: 0,
+        totais: { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
+        porMes: [], porStatus: [], topObras: [], topItens: [], rows: [], errors: [],
+      });
+    }
+
+    const CONCURRENCY = 6;
+    const rows = [];
+    const errors = [];
+    let obrasComDados = 0;
+
+    async function worker(slice) {
+      for (const obra of slice) {
+        try {
+          const data = await uauCall(
+            'Planejamento', 'ConsultarDesembolsoPlanejamento',
+            { Empresa: empCode, Obra: obra.Cod_obr, MesInicial: mesInicial, MesFinal: mesFinal },
+            { timeout: 120000 }
+          );
+          if (Array.isArray(data)) {
+            if (data.length > 0) obrasComDados++;
+            for (const r of data) {
+              rows.push({ ...r, _ObraDescricao: obra.Descr_obr });
+            }
+          }
+        } catch (err) {
+          errors.push({
+            obra: obra.Cod_obr, descricao: obra.Descr_obr,
+            error: err.message, status: err.response?.status,
+          });
+        }
+      }
+    }
+
+    const chunks = Array.from({ length: CONCURRENCY }, () => []);
+    obrasDaEmpresa.forEach((o, i) => chunks[i % CONCURRENCY].push(o));
+    await Promise.all(chunks.map(worker));
+
+    const totais = rows.reduce((acc, r) => {
+      acc.total += Number(r.Total) || 0;
+      acc.totalLiq += Number(r.TotalLiq) || 0;
+      acc.totalBruto += Number(r.TotalBruto) || 0;
+      acc.acrescimo += Number(r.Acrescimo) || 0;
+      acc.desconto += Number(r.Desconto) || 0;
+      return acc;
+    }, { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
+
+    const mesMap = new Map();
+    const statusMap = new Map();
+    const obraMap = new Map();
+    const itemMap = new Map();
+
+    for (const r of rows) {
+      const liq = Number(r.TotalLiq) || 0;
+      const bruto = Number(r.TotalBruto) || 0;
+
+      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
+      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
+      mm.totalLiq += liq;
+      mm.totalBruto += bruto;
+      mm.count++;
+      mesMap.set(ref, mm);
+
+      const st = r.Status || 'sem-status';
+      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
+      sm.total += liq;
+      sm.count++;
+      statusMap.set(st, sm);
+
+      const obraKey = r.Obra;
+      const om = obraMap.get(obraKey) || { obra: obraKey, descricao: r._ObraDescricao, total: 0, count: 0 };
+      om.total += liq;
+      om.count++;
+      obraMap.set(obraKey, om);
+
+      const itemKey = `${r.Item || '-'} | ${r.Composicao || '-'}`;
+      const im = itemMap.get(itemKey) || { item: r.Item, composicao: r.Composicao, total: 0, count: 0 };
+      im.total += liq;
+      im.count++;
+      itemMap.set(itemKey, im);
+    }
+
+    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
+    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
+    const topObras = Array.from(obraMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+
+    res.json({
+      empresa: empCode, mesInicial, mesFinal,
+      obrasTotal: obrasDaEmpresa.length,
+      obrasComDados,
+      linhasTotal: rows.length,
+      totais,
+      porMes, porStatus, topObras, topItens,
+      rows,
+      errors,
+    });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Proxy generico: POST { controller, method, body } ---
+app.post('/api/uau/call', async (req, res) => {
+  const { controller, method, body, timeout } = req.body || {};
+  if (!controller || !method) {
+    return res.status(400).json({ error: 'controller e method sao obrigatorios' });
+  }
+  try {
+    const data = await uauCall(controller, method, body || {}, { timeout: timeout || 60000 });
+    res.json({ ok: true, data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Catalogo de endpoints UAU (validado em 2026-04-14) ---
+// status: 'ok' = funciona | 'params' = existe mas exige parametros | 'slow' = timeout | 'missing' = 404
+app.get('/api/uau/catalog', (req, res) => {
+  res.json({
+    rfs: [
+      {
+        id: 'MASTER',
+        title: 'Dados mestre — funcionais sem parametros',
+        endpoints: [
+          { controller: 'Empresa', method: 'ObterEmpresasAtivas', desc: '322 SPEs do Grupo GVS', status: 'ok', body: {} },
+          { controller: 'Obras', method: 'ObterObrasAtivas', desc: '1429 obras (CGHs, ADM, manutencao)', status: 'ok', body: {} },
+        ],
+      },
+      {
+        id: 'RF02',
+        title: 'Captacao Projetada x Realizada — exige parametros',
+        endpoints: [
+          {
+            controller: 'Planejamento', method: 'ConsultarDesembolsoPlanejamento',
+            desc: 'Desembolso planejado por obra/mes — retorna Status, Item, Insumo, DtaRef, Total, TotalLiq',
+            status: 'params',
+            body: { Empresa: 1, Obra: '102', MesInicial: '01/2024', MesFinal: '12/2025' },
+          },
+          {
+            controller: 'ProcessoPagamento', method: 'ConsultarProcessos',
+            desc: 'Processos de pagamento — endpoint MUITO lento (timeout >3min mesmo com filtros)',
+            status: 'slow',
+            body: { Empresa: 1, Obra: '102' },
+          },
+        ],
+      },
+      {
+        id: 'RF04',
+        title: 'Medicao de obras — consulta pontual',
+        endpoints: [
+          {
+            controller: 'Medicao', method: 'ConsultarMedicao',
+            desc: 'Detalha uma medicao especifica — exige codigo do contrato e da medicao',
+            status: 'params',
+            body: { empresa: 1, contrato: 1, medicao: 1 },
+          },
+        ],
+      },
+      {
+        id: 'DISCOVERY',
+        title: 'Endpoints chutados que NAO existem (404)',
+        endpoints: [
+          { controller: 'Pessoas', method: 'ObterPessoas', desc: '404 — controller nao existe', status: 'missing' },
+          { controller: 'Localidade', method: 'ObterLocalidades', desc: '404', status: 'missing' },
+          { controller: 'Recebiveis', method: 'ConsultarRecebiveis', desc: '404', status: 'missing' },
+          { controller: 'ExtratoDoCliente', method: 'ObterExtratoDoCliente', desc: '404', status: 'missing' },
+          { controller: 'BoletoServices', method: 'ObterBoletoPorTitulo', desc: '404', status: 'missing' },
+          { controller: 'CobrancaPix', method: 'ObterCobrancaPix', desc: '404', status: 'missing' },
+          { controller: 'CessaoRecebiveis', method: 'ObterCessoes', desc: '404', status: 'missing' },
+          { controller: 'Venda', method: 'ObterVendasPorEmpresa', desc: '404', status: 'missing' },
+          { controller: 'NotasFiscais', method: 'ConsultarNotasFiscais', desc: '404', status: 'missing' },
+          { controller: 'Fiscal', method: 'ObterImpostos', desc: '404', status: 'missing' },
+          { controller: 'Contabil', method: 'ConsultarLancamentos', desc: '404', status: 'missing' },
+          { controller: 'Planejamento', method: 'ConsultarCurvaFisicoFinanceira', desc: '404 — metodo nao existe', status: 'missing' },
+        ],
+      },
+    ],
+  });
+});
+
 const PORT = 3001;
 app.listen(PORT, () => {
   console.log(`Backend Solatio rodando em http://localhost:${PORT}`);
