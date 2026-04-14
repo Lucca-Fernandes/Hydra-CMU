@@ -7,6 +7,7 @@ import Energia from './pages/Energia';
 import Clientes from './pages/Clientes';
 import Inadimplencia from './pages/Inadimplencia';
 import SyncLogs from './pages/SyncLogs';
+import UauApi from './pages/UauApi';
 
 const theme = createTheme({
   palette: {
@@ -26,6 +27,7 @@ function App() {
             <Route path="/energia" element={<Energia />} />
             <Route path="/clientes" element={<Clientes />} />
             <Route path="/inadimplencia" element={<Inadimplencia />} />
+            <Route path="/uau-api" element={<UauApi />} />
             <Route path="/sync" element={<SyncLogs />} />
           </Routes>
         </Layout>
