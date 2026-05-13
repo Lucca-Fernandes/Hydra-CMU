@@ -24,7 +24,7 @@ API CMU Solatio (REST externa)
         |
   [sync_v2.js]  -->  Neon Postgres (JSONB)
                            |
-                     [Express :3001]  <--  server.js (5 rotas)
+                     [Express :3001]  <--  server.js (CMU + UAU + Rateio + CMU-org routes)
                            |
                      [React SPA (Vite)]
 ```
@@ -583,6 +583,9 @@ Todas as rotas UAU estao no bloco comentado `UAU ERP (Globaltec / Grupo GVS) —
 - `uauCall(controller, method, body, {retryOn401, timeout})` — wrapper de POST com 2FA, retry em 401, timeout configuravel (default 60s)
 - `getObrasCached()` — cache de 5min do `ObterObrasAtivas`
 - `uauErrorPayload(err)` — formata erro pra resposta HTTP
+- `classifyInsumo(insumo)` — mapeia codigo de insumo (ex: `PLN2429`) para categoria do plano de contas (ex: `Amortizacao`). Usa `sync-service/data/insumo_map.json` (758 insumos). Retorna `"Outros"` se nao mapeado.
+
+**Mapa de insumos** (`sync-service/data/insumo_map.json`): gerado a partir do plano de contas do Grupo GVS. Chave = codigo do insumo UAU, valor = categoria do plano de contas. Categorias principais: `Amortizacao`, `Despesas Juros Financiamento`, `O&M (Material/Pecas/Servicos)`, `Folha`, `Implantacao`, `Encargos de Transmissao`, `Despesas Administrativas`, `Outros emprestimos`, etc. **Nao depende do arquivo XLSX** — o JSON e a fonte autoritativa.
 
 Rotas HTTP expostas:
 
@@ -593,8 +596,57 @@ Rotas HTTP expostas:
 | GET | `/api/uau/empresas` | Proxy direto para `Empresa.ObterEmpresasAtivas`, retorna `{count, items}` |
 | GET | `/api/uau/obras` | Proxy direto para `Obras.ObterObrasAtivas`, retorna `{count, items}` |
 | POST | `/api/uau/call` | Proxy generico. Body: `{controller, method, body, timeout?}`. Usado pelo Explorer da pagina UauApi. |
-| POST | `/api/uau/desembolso/empresa` | **Agregacao por empresa**. Body: `{empresa, mesInicial, mesFinal}`. Itera todas as obras da empresa (concorrencia 6), chama `Planejamento.ConsultarDesembolsoPlanejamento` pra cada, devolve `{totais, porMes, porStatus, topObras, topItens, rows, errors}`. Metricas somam **TotalLiq** (nao `Total`). |
+| POST | `/api/uau/desembolso/empresa` | **Agregacao por empresa**. Body: `{empresa, mesInicial, mesFinal}`. Itera todas as obras da empresa (concorrencia 6). Retorna `{totais, totalAmortizacao, totalJuros, totalOperacional, porMes, porStatus, porCategoria, catPorStatus, topObras, topItens, errors}`. Metricas somam **TotalLiq** (nao `Total`). |
+| POST | `/api/uau/desembolso/obra` | Detalhes de uma obra especifica. Body: `{empresa, obra, mesInicial, mesFinal}`. |
 | GET | `/api/uau/catalog` | Catalogo estatico documentando os RFs e o status (`ok`/`params`/`slow`/`missing`) de cada endpoint, com body sugerido. Consumido pela pagina UauApi. |
+
+**Campos da resposta de `/api/uau/desembolso/empresa`**:
+
+| Campo | Tipo | O que representa |
+|---|---|---|
+| `totais.totalLiq` | float | Comprometido Total = soma de TotalLiq de todos os status (Pago + Pagar + Projetado) |
+| `totalAmortizacao` | float | Subset do totalLiq onde Insumo pertence a categoria "Amortizacao" (PLN2429, PLN2430) |
+| `totalJuros` | float | Subset do totalLiq onde Insumo pertence a "Despesas Juros Financiamento" (PLN1823/24, PLN2431-34) |
+| `totalOperacional` | float | `totalLiq - totalAmortizacao - totalJuros` — despesas operacionais puras |
+| `porStatus` | array | `[{status, total, count}]` — breakdown Pago / Pagar / Projetado |
+| `porCategoria` | array | `[{categoria, total, count}]` — todos os grupos do plano de contas, ordenados por valor |
+| `catPorStatus` | object | `{"Pagar": {"Encargos de Transmissao": 411601, ...}}` — composicao de cada status por categoria |
+| `porMes` | array | `[{mes, totalLiq, totalBruto, count}]` — serie temporal mensal |
+| `topObras` | array | Top 10 obras por TotalLiq |
+| `topItens` | array | Top 15 combinacoes (categoria + item do cronograma) por TotalLiq |
+
+**Interpretacao dos status**:
+- `"Pago"` = desembolso ja realizado, saiu do caixa
+- `"Pagar"` = compromisso financeiro futuro ja lancado (ex: Encargos de Transmissao programados, O&M contratado). **NAO sao emprestimos** — emprestimos aparecem nas categorias "Amortizacao" e "Outros emprestimos"
+- `"Projetado"` = planejamento fisico — `Total` e QUANTIDADE de insumo (nao R$). `TotalLiq` pode ser 0 ou irrelevante financeiramente
+
+### CMU — Receita por Organizacao (rotas de link UAU x CMU)
+
+Bloco `CMU — RECEITA POR ORGANIZACAO` em `server.js`. Liga SPEs do UAU com organizacoes do CMU por correspondencia de nome.
+
+| Metodo | Path | Descricao |
+|---|---|---|
+| GET | `/api/cmu/organizations` | Lista todas as organizacoes distintas do CMU com contagem de UCs (total e ativas). Usado no autocomplete de `GestaoDesembolso`. |
+| POST | `/api/cmu/org-stats` | Body: `{organization, mesInicial?, mesFinal?}`. Retorna metricas de receita da organizacao CMU no periodo. |
+
+**Campos da resposta de `/api/cmu/org-stats`**:
+
+| Campo | Tipo | O que representa |
+|---|---|---|
+| `meters.total` | int | Total de UCs (medidores) vinculados a esta organizacao |
+| `meters.ativas` | int | UCs com `energyMeterStatus = "Ativa"` |
+| `meters.desconectadas` | int | UCs desconectadas |
+| `meters.canceladas` | int | UCs canceladas |
+| `invoices.faturado` | float | Soma de `totalAmount` das faturas com status `"Faturado"` no periodo. **So conta status Faturado** — exclui "Disponivel" (que tem valores negativos/creditos) e "Cancelado"/"Reprovado" |
+| `invoices.economia` | float | Soma de `economyValue` das faturas Faturadas — economia gerada ao cliente (R$) |
+| `invoices.kwh_compensado` | float | Soma de `compensatedEnergy` das faturas Faturadas — energia solar injetada (kWh) |
+| `payments.recebido` | float | Soma de `totalAmount` dos pagamentos com status `"Pago"` — dinheiro efetivamente recebido |
+| `payments.pendente` | float | Soma de `totalAmount` dos pagamentos com status `"Pendente"` ou `"Vencido"` — inadimplencia |
+| `porMes` | array | `[{mes, faturado, recebido}]` — serie mensal de faturamento e recebimentos |
+
+**Periodo dos dados CMU**: dados reais existem de 2025-10 em diante. Periodo padrao na UI: 01/2025 - 12/2026.
+
+**Link UAU x CMU**: feito por correspondencia de nome normalizado. `autoMatchCmuOrg()` no frontend remove acentos, lowercase e cruza palavras significativas (>3 chars) entre `Desc_emp` (UAU) e `organization` (CMU). Nao ha ID compartilhado entre os sistemas — o match e textual.
 
 ### Frontend — paginas UAU
 
@@ -605,17 +657,49 @@ Rotas HTTP expostas:
 - Cards do catalogo tem chip colorido por status (`ok`/`params`/`slow`/`missing`), botao "Testar" desabilitado para missing, e pre-preenche o Explorer com o body sugerido
 - `JsonViewer` com botao copiar para inspecionar respostas
 
-**`src/pages/GestaoDesembolso.jsx`** (`/gestao-desembolso`) — dashboard de gestao:
-- Autocomplete de empresa (`Codigo_emp` + `Desc_emp`) carregada de `/api/uau/empresas`
-- Inputs `MesInicial` / `MesFinal` no formato `mm/yyyy`
-- Chama `/api/uau/desembolso/empresa` ao clicar Carregar
-- 4 KPIs: Planejado Liquido, Planejado Bruto, Acrescimos - Descontos, Obras com dados
-- BarChart (Recharts): Bruto vs Liquido por mes
-- PieChart: distribuicao por Status (dominado por Pago/Pagar; Projetado = R$ 0 porque sua coluna Total nao e dinheiro)
-- Top 10 obras por valor liquido
-- Top 10 itens/composicoes por valor liquido
-- DataGrid com todas as linhas brutas (ate 1 pagina de 50 por default)
-- Alert laranja quando alguma obra falha ao consultar
+**`src/pages/GestaoDesembolso.jsx`** (`/gestao-desembolso`) — dashboard de gestao cruzado UAU x CMU:
+
+**Filtros (unico botao "Carregar" dispara UAU + CMU em paralelo)**:
+- Autocomplete de empresa UAU (`Codigo_emp` + `Desc_emp`)
+- Inputs `MesInicial` / `MesFinal` (formato `mm/yyyy`, padrao 01/2025 - 12/2026)
+- Autocomplete de organizacao CMU — auto-preenchido por correspondencia de nome ao selecionar empresa UAU; editavel
+
+**KPIs UAU (4 cards)**:
+
+| KPI | Fonte | Descricao |
+|---|---|---|
+| Comprometido Total | `totais.totalLiq` | Soma de TotalLiq de todos os status. Card expandido mostra breakdown Pago / Pagar / Projetado com valor, % e top 3 categorias de cada status |
+| Operacional | `totalOperacional` | Total menos amortizacao e juros — despesas de operacao puras |
+| Amortizacao | `totalAmortizacao` | Parcelas de amortizacao de financiamentos (insumos PLN2429, PLN2430) |
+| Juros Financiamento | `totalJuros` | Encargos de juros de financiamentos (PLN1823/24, PLN2431-34) |
+
+**KPIs CMU (4 cards, aparece apos buscar receita)**:
+
+| KPI | Fonte | Descricao |
+|---|---|---|
+| UCs Ativas | `meters.ativas` | Medidores ativos vinculados a esta organizacao |
+| Faturado | `invoices.faturado` | Receita faturada no periodo (so status "Faturado") |
+| Recebido | `payments.recebido` | Receita efetivamente recebida (pagamentos "Pago") |
+| Inadimplente | `payments.pendente` | Soma de pagamentos Pendente + Vencido |
+
+**Card Resultado Liquido** (aparece quando ambos UAU + CMU carregados):
+- Formula: `Recebido CMU - Desembolso Pago UAU`
+- Verde se positivo, vermelho se negativo
+- Mostra Recebido CMU e Pago UAU lado a lado para conferencia
+
+**Graficos**:
+- BarChart combinado: Faturado CMU + Recebido CMU + Desembolso UAU por mes (merge por chave de mes)
+- PieChart: distribuicao UAU por status (Pago / Pagar / Projetado)
+- Barras horizontais: UCs CMU por status (Ativa / Desconectada / Cancelada) + kWh compensado + economia
+
+**Painel de categorias (plano de contas)**:
+- Barras horizontais para cada categoria do plano de contas
+- Amortizacao e Despesas Juros Financiamento destacados com chips coloridos
+- % de participacao no Comprometido Total
+
+**Top categorias por item**: top 15 combinacoes (categoria + item do cronograma) por TotalLiq. Exibe nome legivel da categoria (ex: "O&M (Material/Pecas/Servicos)") em vez de codigo de composicao
+
+**Modal de obra**: ao clicar em obra no Top 10, abre dialog com endereco, fiscal, tipo, data inicio, KPIs de valor, breakdown por status e top itens da obra especifica
 
 ### Scripts auxiliares (`sync-service/`)
 
@@ -800,7 +884,8 @@ node sync_v2.js --full           # Full re-sync
 | `src/pages/Rateio.jsx` | Rateio (nao funcional) |
 | `src/pages/SyncLogs.jsx` | Monitoramento dos logs do sync_v2 |
 | `src/pages/UauApi.jsx` | Explorer da API UAU — catalogo, Explorer generico, listagem de empresas/obras |
-| `src/pages/GestaoDesembolso.jsx` | Dashboard de gestao de desembolso planejado por empresa (UAU) |
+| `src/pages/GestaoDesembolso.jsx` | Dashboard cruzado UAU (desembolso) + CMU (receita) por empresa/SPE |
+| `sync-service/data/insumo_map.json` | Mapa de 758 codigos de insumo UAU para categorias do plano de contas GVS |
 | `src/api/api.js` | `fetchApi()` + `BASE_URL` — wrapper do fetch para Express |
 | `sync-service/server.js` | Express API (rotas CMU + UAU). Bloco UAU comeca em `UAU ERP (Globaltec / Grupo GVS) — Proxy Routes` |
 | `sync-service/sync_v2.js` | Script de sync CMU — MANTER |
