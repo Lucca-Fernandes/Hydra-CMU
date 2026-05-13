@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Box, Typography, Grid, Paper, CircularProgress } from '@mui/material';
+import { Box, Typography, Grid, Paper, CircularProgress, Tooltip as MuiTooltip } from '@mui/material';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, Legend } from 'recharts';
 import ElectricBoltIcon from '@mui/icons-material/ElectricBolt';
 import AccountBalanceWalletIcon from '@mui/icons-material/AccountBalanceWallet';
@@ -20,6 +20,116 @@ const formatMonth = (iso) => {
   return new Date(d.getUTCFullYear(), d.getUTCMonth(), 1)
     .toLocaleDateString('pt-BR', { month: 'short', year: '2-digit' });
 };
+
+const GEO_URL = 'https://raw.githubusercontent.com/giuliano-macedo/geodata-br-states/main/geojson/br_states.geojson';
+
+// Projecao Mercator ajustada para o Brasil (viewBox 0 0 500 520)
+const SCALE = 572, TX = 762.9, TY = 131.5;
+function project([lon, lat]) {
+  const x = (lon * Math.PI / 180) * SCALE + TX;
+  const latR = lat * Math.PI / 180;
+  const y = -Math.log(Math.tan(Math.PI / 4 + latR / 2)) * SCALE + TY;
+  return [x, y];
+}
+
+function geoToPath(geometry) {
+  const rings = geometry.type === 'Polygon'
+    ? geometry.coordinates
+    : geometry.coordinates.flatMap(p => p);
+  return rings.map(ring =>
+    ring.map((pt, i) => {
+      const [x, y] = project(pt);
+      return `${i === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ') + ' Z'
+  ).join(' ');
+}
+
+function BrazilMap({ data }) {
+  const [geoData, setGeoData] = useState(null);
+  const [hovered, setHovered] = useState(null);
+  const [tooltip, setTooltip] = useState({ visible: false, x: 0, y: 0, text: '' });
+
+  useEffect(() => {
+    fetch(GEO_URL)
+      .then(r => r.json())
+      .then(setGeoData)
+      .catch(() => {});
+  }, []);
+
+  const countByState = Object.fromEntries((data || []).map(d => [d.state, d.count]));
+  const max = Math.max(...Object.values(countByState), 1);
+
+  const getColor = (uf) => {
+    const count = countByState[uf] || 0;
+    if (count === 0) return '#dde6f0';
+    const t = 0.15 + (count / max) * 0.85;
+    const r = Math.round(25 + (1 - t) * 160);
+    const g = Math.round(118 - t * 80);
+    const b = Math.round(210 - t * 50);
+    return `rgb(${r},${g},${b})`;
+  };
+
+  if (!geoData) {
+    return (
+      <Box sx={{ display: 'flex', alignItems: 'center', justifyContent: 'center', height: '100%' }}>
+        <CircularProgress size={24} />
+      </Box>
+    );
+  }
+
+  return (
+    <Box sx={{ position: 'relative', width: '100%', height: '100%' }}>
+      <svg viewBox="25 70 450 420" width="100%" height="100%" style={{ display: 'block' }}>
+        {geoData.features.map(feat => {
+          const uf = feat.properties.sigla;
+          const name = feat.properties.nome;
+          const count = countByState[uf] || 0;
+          const d = geoToPath(feat.geometry);
+          return (
+            <path
+              key={uf}
+              d={d}
+              fill={getColor(uf)}
+              stroke="#fff"
+              strokeWidth={0.8}
+              style={{ cursor: 'default', transition: 'fill 0.15s' }}
+              onMouseEnter={e => {
+                setHovered(uf);
+                const rect = e.currentTarget.closest('svg').getBoundingClientRect();
+                setTooltip({ visible: true, x: e.clientX - rect.left, y: e.clientY - rect.top, uf, name, count });
+              }}
+              onMouseMove={e => {
+                const rect = e.currentTarget.closest('svg').getBoundingClientRect();
+                setTooltip(t => ({ ...t, x: e.clientX - rect.left, y: e.clientY - rect.top }));
+              }}
+              onMouseLeave={() => { setHovered(null); setTooltip(t => ({ ...t, visible: false })); }}
+              opacity={hovered && hovered !== uf ? 0.75 : 1}
+            />
+          );
+        })}
+      </svg>
+      {tooltip.visible && (
+        <Box sx={{
+          position: 'absolute', pointerEvents: 'none', zIndex: 10,
+          left: tooltip.x + 8, top: tooltip.y - 36,
+          bgcolor: 'rgba(0,0,0,0.78)', color: '#fff', borderRadius: '6px',
+          px: 1, py: 0.5, fontSize: '0.7rem', whiteSpace: 'nowrap',
+        }}>
+          <b>{tooltip.name} ({tooltip.uf})</b><br />
+          {tooltip.count.toLocaleString('pt-BR')} medidores
+        </Box>
+      )}
+      <Box sx={{ position: 'absolute', bottom: 0, right: 4, display: 'flex', alignItems: 'center', gap: 0.4 }}>
+        <Typography sx={{ fontSize: '0.58rem', color: 'text.secondary' }}>Menos</Typography>
+        {[0.15, 0.4, 0.65, 0.9].map((t, i) => {
+          const r = Math.round(25 + (1-t)*160), g = Math.round(118 - t*80), b = Math.round(210 - t*50);
+          return <Box key={i} sx={{ width: 11, height: 11, borderRadius: '2px', bgcolor: `rgb(${r},${g},${b})` }} />;
+        })}
+        <Typography sx={{ fontSize: '0.58rem', color: 'text.secondary' }}>Mais</Typography>
+      </Box>
+    </Box>
+  );
+}
 
 export default function Dashboard() {
   const [stats, setStats] = useState(null);
@@ -137,11 +247,11 @@ export default function Dashboard() {
         <Grid size={{ xs: 12, md: 5 }}>
           <Grid container spacing={2}>
             <Grid size={12}>
-              <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 163 }}>
-                <Typography variant="subtitle2" fontWeight="800" sx={{ fontSize: '0.75rem', textTransform: 'uppercase', mb: 1, color: 'text.secondary' }}>
+              <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 132 }}>
+                <Typography variant="subtitle2" fontWeight="800" sx={{ fontSize: '0.75rem', textTransform: 'uppercase', mb: 0.5, color: 'text.secondary' }}>
                   Medidores por Status
                 </Typography>
-                <ResponsiveContainer width="100%" height={115}>
+                <ResponsiveContainer width="100%" height={90}>
                   <PieChart>
                     <Pie data={statusPieData} dataKey="value" cx="50%" cy="50%" outerRadius={45} innerRadius={25} paddingAngle={2}>
                       {statusPieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
@@ -153,19 +263,13 @@ export default function Dashboard() {
               </Paper>
             </Grid>
             <Grid size={12}>
-              <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 163 }}>
-                <Typography variant="subtitle2" fontWeight="800" sx={{ fontSize: '0.75rem', textTransform: 'uppercase', mb: 1, color: 'text.secondary' }}>
+              <Paper variant="outlined" sx={{ p: 2, borderRadius: '12px', height: 200 }}>
+                <Typography variant="subtitle2" fontWeight="800" sx={{ fontSize: '0.75rem', textTransform: 'uppercase', mb: 0.5, color: 'text.secondary' }}>
                   Distribuicao por Estado
                 </Typography>
-                <ResponsiveContainer width="100%" height={115}>
-                  <PieChart>
-                    <Pie data={statePieData} dataKey="value" cx="50%" cy="50%" outerRadius={45} innerRadius={25} paddingAngle={2}>
-                      {statePieData.map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                    </Pie>
-                    <Tooltip formatter={(v) => v.toLocaleString('pt-BR')} />
-                    <Legend iconSize={8} wrapperStyle={{ fontSize: '0.65rem' }} />
-                  </PieChart>
-                </ResponsiveContainer>
+                <Box sx={{ height: 160, position: 'relative' }}>
+                  <BrazilMap data={stats.metersByState} />
+                </Box>
               </Paper>
             </Grid>
           </Grid>
