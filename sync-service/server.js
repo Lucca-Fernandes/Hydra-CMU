@@ -2,6 +2,19 @@ require('dotenv').config({ path: '../.env' });
 const express = require('express');
 const cors = require('cors');
 const { Pool } = require('pg');
+const path = require('path');
+const fs = require('fs');
+
+const INSUMO_MAP = JSON.parse(
+  fs.readFileSync(path.join(__dirname, 'data/insumo_map.json'), 'utf-8')
+);
+const AMORTIZACAO_CATS = new Set(['Amortização']);
+const JUROS_CATS = new Set(['Despesas Juros Financiamento']);
+
+function classifyInsumo(insumo) {
+  if (!insumo) return 'Outros';
+  return INSUMO_MAP[String(insumo).trim()] || 'Outros';
+}
 
 const app = express();
 app.use(cors());
@@ -9,14 +22,32 @@ app.use(express.json());
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false },
+  max: 5,                          // Neon free tier tem limite baixo de conexoes
+  idleTimeoutMillis: 20000,        // libera conexoes ociosas antes do Neon fechar (~30s)
+  connectionTimeoutMillis: 30000,  // timeout de aquisicao de conexao (Neon cold start pode levar ~20s)
 });
 
-pool.connect((err, client, release) => {
-  if (err) return console.error('Erro ao conectar ao Neon Postgres:', err.stack);
-  console.log('Conexao com o Neon Postgres estabelecida');
-  release();
+// Neon fecha conexoes ociosas — evita crash por unhandled error no pool
+pool.on('error', (err) => {
+  console.warn('pg-pool idle client error (reconectando automaticamente):', err.message);
 });
+
+// Tenta conectar com retry para lidar com cold start do Neon
+(async () => {
+  for (let i = 0; i < 5; i++) {
+    try {
+      const client = await pool.connect();
+      client.release();
+      console.log('Conexao com o Neon Postgres estabelecida');
+      return;
+    } catch (err) {
+      console.warn(`Tentativa ${i + 1} de conexao falhou: ${err.message}. Aguardando...`);
+      await new Promise(r => setTimeout(r, 3000));
+    }
+  }
+  console.error('Nao foi possivel conectar ao Neon Postgres apos 5 tentativas.');
+})();
 
 app.get('/api/EnergyMeters', async (req, res) => {
   try {
@@ -578,7 +609,10 @@ const initRateioTables = async () => {
     console.log(`Seed: ${seed.length} usinas inseridas`);
   }
 };
-initRateioTables().catch(err => console.error('Erro ao criar tabelas rateio:', err));
+// Aguarda 5s para nao competir com o cold start do Neon
+setTimeout(() => {
+  initRateioTables().catch(err => console.error('Erro ao criar tabelas rateio:', err));
+}, 5000);
 
 app.get('/api/rateio/plants', async (req, res) => {
   try {
@@ -862,6 +896,140 @@ app.patch('/api/rateio/results/:id', async (req, res) => {
 });
 
 // ============================================================
+// CMU — RECEITA POR ORGANIZACAO (link com UAU)
+// ============================================================
+
+app.get('/api/cmu/organizations', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        data->>'organization' as organization,
+        COUNT(*)::int as total,
+        COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Ativa')::int as ativas
+      FROM cmu_energy_meters
+      WHERE data->>'organization' IS NOT NULL AND data->>'organization' != ''
+      GROUP BY 1
+      ORDER BY 2 DESC
+    `);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/cmu/org-stats', async (req, res) => {
+  const { organization, mesInicial, mesFinal } = req.body || {};
+  if (!organization) return res.status(400).json({ error: 'organization e obrigatorio' });
+
+  const toIso = (mmyyyy) => {
+    if (!mmyyyy || !/^\d{2}\/\d{4}$/.test(mmyyyy)) return null;
+    const [mm, yyyy] = mmyyyy.split('/');
+    return `${yyyy}-${mm}-01T00:00:00`;
+  };
+  const startDate = toIso(mesInicial);
+  const endDate = toIso(mesFinal);
+
+  const dateCond = (col) => {
+    const parts = [];
+    if (startDate) parts.push(`${col} >= '${startDate}'`);
+    if (endDate) parts.push(`${col} <= '${endDate}'`);
+    return parts.length ? ' AND ' + parts.join(' AND ') : '';
+  };
+
+  try {
+    const [meterRes, invoiceRes, paymentRes, invMonthRes, payMonthRes] = await Promise.all([
+      pool.query(`
+        SELECT
+          COUNT(*)::int as total,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Ativa')::int as ativas,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Desconectada')::int as desconectadas,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Cancelada')::int as canceladas
+        FROM cmu_energy_meters
+        WHERE data->>'organization' = $1
+      `, [organization]),
+
+      pool.query(`
+        SELECT
+          COALESCE(SUM((i.data->>'totalAmount')::numeric) FILTER (
+            WHERE i.data->>'energyMeterInvoiceStatus' = 'Faturado'
+          ), 0)::float as faturado,
+          COALESCE(SUM((i.data->>'economyValue')::numeric) FILTER (
+            WHERE i.data->>'energyMeterInvoiceStatus' = 'Faturado'
+          ), 0)::float as economia,
+          COALESCE(SUM((i.data->>'compensatedEnergy')::numeric) FILTER (
+            WHERE i.data->>'energyMeterInvoiceStatus' = 'Faturado'
+          ), 0)::float as kwh_compensado
+        FROM cmu_energy_meter_invoices i
+        JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int = m.id
+        WHERE m.data->>'organization' = $1
+        ${dateCond("i.data->>'referenceMonth'")}
+      `, [organization]),
+
+      pool.query(`
+        SELECT
+          COALESCE(SUM((p.data->>'totalAmount')::numeric) FILTER (
+            WHERE p.data->>'energyMeterPaymentStatus' = 'Pago'
+          ), 0)::float as recebido,
+          COALESCE(SUM((p.data->>'totalAmount')::numeric) FILTER (
+            WHERE p.data->>'energyMeterPaymentStatus' IN ('Pendente','Vencido')
+          ), 0)::float as pendente
+        FROM cmu_energy_meter_payments p
+        JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int = m.id
+        WHERE m.data->>'organization' = $1
+        ${dateCond("p.data->>'referenceMonth'")}
+      `, [organization]),
+
+      pool.query(`
+        SELECT
+          LEFT(i.data->>'referenceMonth', 7) as mes,
+          COALESCE(SUM((i.data->>'totalAmount')::numeric) FILTER (
+            WHERE i.data->>'energyMeterInvoiceStatus' = 'Faturado'
+          ), 0)::float as faturado
+        FROM cmu_energy_meter_invoices i
+        JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int = m.id
+        WHERE m.data->>'organization' = $1
+        ${dateCond("i.data->>'referenceMonth'")}
+        GROUP BY 1 ORDER BY 1
+      `, [organization]),
+
+      pool.query(`
+        SELECT
+          LEFT(p.data->>'referenceMonth', 7) as mes,
+          COALESCE(SUM((p.data->>'totalAmount')::numeric) FILTER (
+            WHERE p.data->>'energyMeterPaymentStatus' = 'Pago'
+          ), 0)::float as recebido
+        FROM cmu_energy_meter_payments p
+        JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int = m.id
+        WHERE m.data->>'organization' = $1
+        ${dateCond("p.data->>'referenceMonth'")}
+        GROUP BY 1 ORDER BY 1
+      `, [organization]),
+    ]);
+
+    const monthMap = {};
+    for (const r of invMonthRes.rows) {
+      monthMap[r.mes] = { mes: r.mes, faturado: r.faturado, recebido: 0 };
+    }
+    for (const r of payMonthRes.rows) {
+      if (monthMap[r.mes]) monthMap[r.mes].recebido = r.recebido;
+      else monthMap[r.mes] = { mes: r.mes, faturado: 0, recebido: r.recebido };
+    }
+    const porMes = Object.values(monthMap).sort((a, b) => a.mes.localeCompare(b.mes));
+
+    res.json({
+      organization, mesInicial, mesFinal,
+      meters: meterRes.rows[0],
+      invoices: invoiceRes.rows[0],
+      payments: paymentRes.rows[0],
+      porMes,
+    });
+  } catch (err) {
+    console.error('Erro em /api/cmu/org-stats:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============================================================
 // SYNC LOGS API
 // ============================================================
 
@@ -1120,6 +1288,121 @@ app.post('/api/uau/desembolso/empresa', async (req, res) => {
     const statusMap = new Map();
     const obraMap = new Map();
     const itemMap = new Map();
+    const catMap = new Map();
+    // categoria por status: { 'Pagar': { 'Amortização': 123, ... }, 'Pago': {...} }
+    const catPorStatus = {};
+
+    let totalAmortizacao = 0;
+    let totalJuros = 0;
+
+    for (const r of rows) {
+      const liq = Number(r.TotalLiq) || 0;
+      const bruto = Number(r.TotalBruto) || 0;
+      const categoria = classifyInsumo(r.Insumo);
+      const st = r.Status || 'sem-status';
+
+      // Separar Amortizacao e Juros
+      if (AMORTIZACAO_CATS.has(categoria)) totalAmortizacao += liq;
+      else if (JUROS_CATS.has(categoria)) totalJuros += liq;
+
+      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
+      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
+      mm.totalLiq += liq;
+      mm.totalBruto += bruto;
+      mm.count++;
+      mesMap.set(ref, mm);
+
+      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
+      sm.total += liq;
+      sm.count++;
+      statusMap.set(st, sm);
+
+      const obraKey = r.Obra;
+      const om = obraMap.get(obraKey) || { obra: obraKey, descricao: r._ObraDescricao, total: 0, count: 0 };
+      om.total += liq;
+      om.count++;
+      obraMap.set(obraKey, om);
+
+      const catKey = categoria;
+      const cm = catMap.get(catKey) || { categoria, total: 0, count: 0 };
+      cm.total += liq;
+      cm.count++;
+      catMap.set(catKey, cm);
+
+      // Breakdown de categoria por status
+      if (!catPorStatus[st]) catPorStatus[st] = {};
+      catPorStatus[st][categoria] = (catPorStatus[st][categoria] || 0) + liq;
+
+      // Top itens mostra categoria + item do cronograma
+      const itemKey = `${categoria} | ${r.Item || '-'}`;
+      const im = itemMap.get(itemKey) || { item: r.Item, categoria, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
+      im.total += liq;
+      im.count++;
+      itemMap.set(itemKey, im);
+    }
+
+    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
+    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
+    const topObras = Array.from(obraMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
+    const porCategoria = Array.from(catMap.values()).sort((a, b) => b.total - a.total);
+    const totalOperacional = totais.totalLiq - totalAmortizacao - totalJuros;
+
+    res.json({
+      empresa: empCode, mesInicial, mesFinal,
+      obrasTotal: obrasDaEmpresa.length,
+      obrasComDados,
+      linhasTotal: rows.length,
+      totais,
+      totalAmortizacao,
+      totalJuros,
+      totalOperacional,
+      porMes, porStatus, porCategoria, catPorStatus, topObras, topItens,
+      errors,
+    });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Detalhes de uma obra específica ---
+app.post('/api/uau/desembolso/obra', async (req, res) => {
+  const { empresa, obra, mesInicial, mesFinal } = req.body || {};
+  if (!empresa || !obra || !mesInicial || !mesFinal) {
+    return res.status(400).json({ error: 'empresa, obra, mesInicial e mesFinal sao obrigatorios' });
+  }
+  try {
+    const obras = await getObrasCached();
+    const obraData = obras.find(o => String(o.Cod_obr) === String(obra));
+    if (!obraData) {
+      return res.status(404).json({ error: 'Obra nao encontrada' });
+    }
+
+    const rows = await uauCall(
+      'Planejamento', 'ConsultarDesembolsoPlanejamento',
+      { Empresa: Number(empresa), Obra: String(obra), MesInicial: mesInicial, MesFinal: mesFinal },
+      { timeout: 120000 }
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({
+        obra: obraData, rows: [],
+        porMes: [], porStatus: [], topItens: [],
+        totais: { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
+      });
+    }
+
+    const totais = rows.reduce((acc, r) => {
+      acc.totalLiq += Number(r.TotalLiq) || 0;
+      acc.totalBruto += Number(r.TotalBruto) || 0;
+      acc.acrescimo += Number(r.Acrescimo) || 0;
+      acc.desconto += Number(r.Desconto) || 0;
+      return acc;
+    }, { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
+
+    const mesMap = new Map();
+    const statusMap = new Map();
+    const itemMap = new Map();
 
     for (const r of rows) {
       const liq = Number(r.TotalLiq) || 0;
@@ -1138,14 +1421,8 @@ app.post('/api/uau/desembolso/empresa', async (req, res) => {
       sm.count++;
       statusMap.set(st, sm);
 
-      const obraKey = r.Obra;
-      const om = obraMap.get(obraKey) || { obra: obraKey, descricao: r._ObraDescricao, total: 0, count: 0 };
-      om.total += liq;
-      om.count++;
-      obraMap.set(obraKey, om);
-
       const itemKey = `${r.Item || '-'} | ${r.Composicao || '-'}`;
-      const im = itemMap.get(itemKey) || { item: r.Item, composicao: r.Composicao, total: 0, count: 0 };
+      const im = itemMap.get(itemKey) || { item: r.Item, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
       im.total += liq;
       im.count++;
       itemMap.set(itemKey, im);
@@ -1153,18 +1430,13 @@ app.post('/api/uau/desembolso/empresa', async (req, res) => {
 
     const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
     const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
-    const topObras = Array.from(obraMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
-    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
 
     res.json({
-      empresa: empCode, mesInicial, mesFinal,
-      obrasTotal: obrasDaEmpresa.length,
-      obrasComDados,
-      linhasTotal: rows.length,
+      obra: obraData,
       totais,
-      porMes, porStatus, topObras, topItens,
+      porMes, porStatus, topItens,
       rows,
-      errors,
     });
   } catch (err) {
     res.status(500).json(uauErrorPayload(err));
@@ -1251,6 +1523,15 @@ app.get('/api/uau/catalog', (req, res) => {
 });
 
 const PORT = 3001;
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log(`Backend Solatio rodando em http://localhost:${PORT}`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\nERRO: porta ${PORT} ja esta em uso. Encerre o processo anterior e tente novamente.\n  kill $(lsof -ti :${PORT})\n`);
+  } else {
+    console.error('Erro no servidor:', err);
+  }
+  process.exit(1);
 });
