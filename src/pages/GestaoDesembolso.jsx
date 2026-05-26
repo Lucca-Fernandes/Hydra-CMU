@@ -78,7 +78,10 @@ export default function GestaoDesembolso() {
   useEffect(() => {
     setLoadingEmpresas(true);
     fetch(`${BASE_URL}/uau/empresas`)
-      .then((r) => r.json())
+      .then((r) => {
+        if (!r.ok) throw new Error(`UAU indisponível (${r.status})`);
+        return r.json();
+      })
       .then((d) => setEmpresas(d.items || []))
       .catch((e) => setError(`Falha ao carregar empresas: ${e.message}`))
       .finally(() => setLoadingEmpresas(false));
@@ -497,8 +500,9 @@ export default function GestaoDesembolso() {
                 <Stack spacing={1.5} sx={{ mt: 2 }}>
                   {[
                     { label: 'Ativas', value: cmuStats.meters.ativas, color: '#2e7d32' },
-                    { label: 'Desconectadas', value: cmuStats.meters.desconectadas, color: '#ed6c02' },
-                    { label: 'Canceladas', value: cmuStats.meters.canceladas, color: '#c62828' },
+                    { label: 'Inativas', value: cmuStats.meters.inativas, color: '#ed6c02' },
+                    { label: 'Suspensas', value: cmuStats.meters.suspensos, color: '#c62828' },
+                    { label: 'Excluídas', value: cmuStats.meters.excluidas, color: '#757575' },
                   ].map(({ label, value, color }) => (
                     <Stack key={label} spacing={0.5}>
                       <Stack direction="row" justifyContent="space-between">

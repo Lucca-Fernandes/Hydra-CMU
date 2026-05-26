@@ -9,7 +9,16 @@ require('dotenv').config({ path: path.resolve(__dirname, '../.env') });
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
-    ssl: { rejectUnauthorized: false }
+    ssl: { rejectUnauthorized: false },
+    max: 5,                          // Neon free tier tem limite baixo de conexoes
+    idleTimeoutMillis: 20000,        // libera conexoes ociosas antes do Neon fechar (~30s)
+    connectionTimeoutMillis: 30000,  // Neon cold start pode levar ~20s
+});
+
+// Neon derruba conexoes ociosas; sem este handler o 'error' nao tratado
+// no client ocioso derruba o processo inteiro (foi o que matou o sync na pag ~687).
+pool.on('error', (err) => {
+    log('WARN', null, `pg-pool idle client error (ignorado, reconecta sozinho): ${err.message}`);
 });
 
 const api = axios.create({
@@ -18,9 +27,10 @@ const api = axios.create({
     timeout: 180000
 });
 
-const PAGE_SIZE = 15;
+const PAGE_SIZE = parseInt(process.env.PAGE_SIZE, 10) || 15; // a API CMU leva ~61s/request seja qual for o tamanho — PAGE_SIZE alto acelera MUITO (mas invalida checkpoints de runs com tamanho diferente)
 const MAX_RETRIES = 5;
 const BASE_DELAY_MS = 5000;
+const EMPTY_PAGE_RETRIES = 3; // reconfirma página vazia antes de concluir "fim dos dados"
 
 // ============================================================
 // REGISTRY DE ENDPOINTS
@@ -33,11 +43,12 @@ const ENDPOINTS = [
     {
         name: 'EnergyMeters',
         table: 'cmu_energy_meters',
-        idField: 'id',
+        idField: 'energyMeterID', // API CMU retorna energyMeterID, NUNCA 'id' — usar 'id' fazia skip de 100%
         phase: 1,
         hasMeterFK: false,
         isMeter: true,
-        supportsIncremental: true,
+        supportsIncremental: false, // API ignora silenciosamente o filtro updatedAt — incremental seria scan completo enganoso
+        rawData: false, // rawData=true devolve distributor/voucher/customer/expiredPaymentsTotalAmount como NULL — precisa do payload completo
     },
     {
         name: 'Contacts',
@@ -83,7 +94,7 @@ const ENDPOINTS = [
         phase: 2,
         hasMeterFK: true,
         isMeter: false,
-        supportsIncremental: true,
+        supportsIncremental: false, // API ignora filtro updatedAt (verificado)
     },
     {
         name: 'EnergyMeterInvoices',
@@ -92,7 +103,7 @@ const ENDPOINTS = [
         phase: 2,
         hasMeterFK: true,
         isMeter: false,
-        supportsIncremental: true,
+        supportsIncremental: false, // API ignora filtro updatedAt (verificado)
     },
     {
         name: 'EnergyMeterPayments',
@@ -101,7 +112,7 @@ const ENDPOINTS = [
         phase: 2,
         hasMeterFK: true,
         isMeter: false,
-        supportsIncremental: true,
+        supportsIncremental: false, // API ignora filtro updatedAt (verificado)
     },
 ];
 
@@ -208,7 +219,7 @@ async function upsertRow(client, ep, item) {
 // SYNC DE UM ENDPOINT
 // ============================================================
 
-async function syncEndpoint(ep, { mode }) {
+async function syncEndpoint(ep, { mode, forceFresh = false }) {
     log('INFO', ep.name, `Iniciando sync (modo: ${mode})`);
 
     // Garante registro no sync_control
@@ -241,14 +252,26 @@ async function syncEndpoint(ep, { mode }) {
         }
     }
 
-    // Reset página no modo full
+    // Modo full: RETOMA de last_page_processed em vez de zerar.
+    // Isso torna o sync resiliente a crash/sleep do laptop — cada restart
+    // continua de onde parou, acumulando progresso até completar o passe inteiro.
+    // (upsert é idempotente, então re-fazer a página do checkpoint é seguro).
+    // --fresh força recomeço da página 1 quando se quer um re-scan completo.
     let currentPage;
     if (effectiveMode === 'full') {
-        await pool.query(
-            'UPDATE sync_control SET last_page_processed = 1 WHERE endpoint_name = $1',
-            [ep.name]
-        );
-        currentPage = 1;
+        if (forceFresh) {
+            await pool.query(
+                'UPDATE sync_control SET last_page_processed = 1 WHERE endpoint_name = $1',
+                [ep.name]
+            );
+            currentPage = 1;
+            log('INFO', ep.name, 'Modo --fresh: recomeçando da página 1');
+        } else {
+            currentPage = control.last_page_processed || 1;
+            if (currentPage > 1) {
+                log('INFO', ep.name, `Retomando da página ${currentPage} (run anterior interrompido)`);
+            }
+        }
     } else {
         // Incremental sempre começa da página 1 (com filtro de data)
         currentPage = 1;
@@ -260,11 +283,24 @@ async function syncEndpoint(ep, { mode }) {
 
     while (hasMore && !shutdownRequested) {
         const pageResult = await withRetry(async () => {
-            const url = `/${ep.name}?page=${currentPage}&pageSize=${PAGE_SIZE}&rawData=true${filterParam}`;
+            const rawData = ep.rawData === false ? 'false' : 'true';
+            const url = `/${ep.name}?page=${currentPage}&pageSize=${PAGE_SIZE}&rawData=${rawData}${filterParam}`;
             log('INFO', ep.name, `Página ${currentPage}...`);
 
-            const response = await api.get(url);
-            const items = response.data;
+            let response = await api.get(url);
+            let items = response.data;
+
+            // Página vazia pode ser fim real OU soluço transitório da API.
+            // Reconfirma algumas vezes antes de concluir — sem isso, um blip
+            // numa das ~1246 páginas truncava o sync e marcava "concluído".
+            let emptyConfirm = 0;
+            while ((!items || !Array.isArray(items) || items.length === 0) && emptyConfirm < EMPTY_PAGE_RETRIES) {
+                emptyConfirm++;
+                log('WARN', ep.name, `Página ${currentPage} vazia — reconfirmando (${emptyConfirm}/${EMPTY_PAGE_RETRIES})...`);
+                await sleep(BASE_DELAY_MS);
+                response = await api.get(url);
+                items = response.data;
+            }
 
             if (!items || !Array.isArray(items) || items.length === 0) {
                 return { done: true, processed: 0, skipped: 0 };
@@ -273,6 +309,17 @@ async function syncEndpoint(ep, { mode }) {
             const client = await pool.connect();
             let pageProcessed = 0;
             let pageSkipped = 0;
+            let clientBroken = false;
+
+            // Se o socket do client EM USO morre (Neon derruba, laptop dorme), o pg
+            // emite 'error' no Client; sem este listener vira "Unhandled 'error' event"
+            // e mata o processo. Foi o que matou o sync na pág 204. O withRetry refaz a página.
+            // Handler nomeado + removeListener no finally pra nao acumular em clients reusados.
+            const onClientError = (err) => {
+                clientBroken = true;
+                log('WARN', ep.name, `client error (descartando conexao, withRetry refaz a pagina): ${err.message}`);
+            };
+            client.on('error', onClientError);
 
             try {
                 await client.query('BEGIN');
@@ -292,10 +339,14 @@ async function syncEndpoint(ep, { mode }) {
                 );
                 await client.query('COMMIT');
             } catch (err) {
-                await client.query('ROLLBACK');
+                clientBroken = true;
+                // ROLLBACK pode falhar se a conexao ja morreu — nao deixar isso mascarar o erro real
+                try { await client.query('ROLLBACK'); } catch (_) { /* conexao morta, ignora */ }
                 throw err;
             } finally {
-                client.release();
+                client.removeListener('error', onClientError);
+                // release(err) descarta o client quebrado em vez de devolver pro pool envenenado
+                client.release(clientBroken ? new Error('client quebrado') : undefined);
             }
 
             return { done: false, processed: pageProcessed, skipped: pageSkipped };
@@ -310,15 +361,20 @@ async function syncEndpoint(ep, { mode }) {
         }
     }
 
-    // Marcar como concluído
-    if (!shutdownRequested) {
+    // Marcar como concluído (com guard contra falso sucesso)
+    if (shutdownRequested) {
+        log('WARN', ep.name, `Interrompido na página ${currentPage} — ${totalProcessed} salvos até aqui`);
+    } else if (totalProcessed === 0 && totalSkipped > 0) {
+        // A API devolveu itens mas TODOS foram pulados — sintoma clássico de
+        // idField errado (foi o bug que sumiu com 12k medidores). Não marca
+        // concluído pra não mascarar o problema e forçar novo full no próximo run.
+        log('ERROR', ep.name, `0 salvos / ${totalSkipped} pulados — provável idField incorreto. NÃO marcando como concluído.`);
+    } else {
         await pool.query(
             'UPDATE sync_control SET last_sync_completed_at = NOW(), sync_mode = $1 WHERE endpoint_name = $2',
             [effectiveMode, ep.name]
         );
         log('INFO', ep.name, `Concluído — ${totalProcessed} registros salvos, ${totalSkipped} pulados`);
-    } else {
-        log('WARN', ep.name, `Interrompido na página ${currentPage} — ${totalProcessed} salvos até aqui`);
     }
 }
 
@@ -326,9 +382,9 @@ async function syncEndpoint(ep, { mode }) {
 // ORQUESTRADOR
 // ============================================================
 
-async function runSync(mode, onlyEndpoint) {
+async function runSync(mode, onlyEndpoint, forceFresh = false) {
     log('INFO', null, `========================================`);
-    log('INFO', null, `SYNC V2 — Modo: ${mode.toUpperCase()}`);
+    log('INFO', null, `SYNC V2 — Modo: ${mode.toUpperCase()}${forceFresh ? ' (--fresh)' : ''}`);
     log('INFO', null, `========================================`);
 
     // Rodar migration automática (CREATE IF NOT EXISTS é seguro)
@@ -362,7 +418,7 @@ async function runSync(mode, onlyEndpoint) {
             continue;
         }
         try {
-            await syncEndpoint(ep, { mode });
+            await syncEndpoint(ep, { mode, forceFresh });
             results.success.push(ep.name);
         } catch (err) {
             log('ERROR', ep.name, `Falha após ${MAX_RETRIES} tentativas: ${err.message}`);
@@ -385,13 +441,15 @@ async function runSync(mode, onlyEndpoint) {
 // CLI
 // ============================================================
 // node sync_v2.js                                -> incremental (default)
-// node sync_v2.js --full                         -> full re-sync
+// node sync_v2.js --full                         -> full re-sync (RETOMA de onde parou)
+// node sync_v2.js --full --fresh                 -> full re-sync recomeçando da página 1
 // node sync_v2.js --full --endpoint=EnergyMeters -> full de um endpoint
 // node sync_v2.js --endpoint=Contacts            -> incremental de um endpoint
 
 const args = process.argv.slice(2);
 const mode = args.includes('--full') ? 'full' : 'incremental';
+const forceFresh = args.includes('--fresh');
 const endpointArg = args.find(a => a.startsWith('--endpoint='));
 const onlyEndpoint = endpointArg ? endpointArg.split('=')[1] : null;
 
-runSync(mode, onlyEndpoint);
+runSync(mode, onlyEndpoint, forceFresh);

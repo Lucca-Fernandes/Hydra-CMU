@@ -1,4 +1,4 @@
-import { Box, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography, Divider } from '@mui/material';
+import { Box, Drawer, List, ListItemButton, ListItemIcon, ListItemText, Typography, Divider, Chip } from '@mui/material';
 import DashboardIcon from '@mui/icons-material/Dashboard';
 import AttachMoneyIcon from '@mui/icons-material/AttachMoney';
 import BoltIcon from '@mui/icons-material/Bolt';
@@ -7,9 +7,10 @@ import WarningAmberIcon from '@mui/icons-material/WarningAmber';
 import SyncIcon from '@mui/icons-material/Sync';
 import ApiIcon from '@mui/icons-material/Api';
 import InsightsIcon from '@mui/icons-material/Insights';
+import AccountBalanceIcon from '@mui/icons-material/AccountBalance';
 import { useNavigate, useLocation } from 'react-router-dom';
 
-const DRAWER_WIDTH = 230;
+const DRAWER_WIDTH = 244;
 
 const navItems = [
   { label: 'Dashboard', path: '/', icon: <DashboardIcon /> },
@@ -18,7 +19,7 @@ const navItems = [
   { label: 'Clientes', path: '/clientes', icon: <PeopleIcon /> },
   { label: 'Inadimplência', path: '/inadimplencia', icon: <WarningAmberIcon /> },
   { label: 'UAU API', path: '/uau-api', icon: <ApiIcon /> },
-  { label: 'Gestão Desembolso', path: '/gestao-desembolso', icon: <InsightsIcon /> },
+  { label: 'Financeiro 2.0', path: '/financeiro-2', icon: <AccountBalanceIcon />, highlight: true },
   { label: 'Sync Logs', path: '/sync', icon: <SyncIcon /> },
 ];
 
@@ -27,7 +28,7 @@ export default function Layout({ children }) {
   const location = useLocation();
 
   return (
-    <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+    <Box sx={{ display: 'flex', height: '100vh', overflow: 'hidden', bgcolor: 'background.default' }}>
       <Drawer
         variant="permanent"
         sx={{
@@ -35,22 +36,35 @@ export default function Layout({ children }) {
           flexShrink: 0,
           '& .MuiDrawer-paper': {
             width: DRAWER_WIDTH,
-            bgcolor: '#0d1b2a',
-            color: '#fff',
-            borderRight: 'none',
+            border: 'none',
+            background: 'linear-gradient(180deg, #0d1426 0%, #0a0f1e 100%)',
+            color: '#e8edf7',
+            borderRight: '1px solid rgba(148,163,184,0.10)',
           },
         }}
       >
-        <Box sx={{ p: 2.5, pb: 1.5 }}>
-          <Typography variant="h6" fontWeight="900" sx={{ color: '#fff', letterSpacing: 1 }}>
-            SOLATIO
-          </Typography>
-          <Typography variant="caption" sx={{ color: 'rgba(255,255,255,0.5)', fontWeight: 600 }}>
-            Power Analytics
-          </Typography>
+        <Box sx={{ p: 2.5, pb: 2 }}>
+          <Box sx={{ display: 'flex', alignItems: 'center', gap: 1 }}>
+            <Box sx={{
+              width: 34, height: 34, borderRadius: '10px',
+              background: 'linear-gradient(135deg, #38bdf8 0%, #22c55e 100%)',
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              boxShadow: '0 4px 14px rgba(56,189,248,0.35)',
+            }}>
+              <BoltIcon sx={{ color: '#0a0f1e', fontSize: 20 }} />
+            </Box>
+            <Box>
+              <Typography variant="subtitle1" fontWeight="900" sx={{ color: '#fff', lineHeight: 1, letterSpacing: 0.5 }}>
+                SOLATIO
+              </Typography>
+              <Typography variant="caption" sx={{ color: '#64b5f6', fontWeight: 600, fontSize: '0.62rem', letterSpacing: 1 }}>
+                POWER ANALYTICS
+              </Typography>
+            </Box>
+          </Box>
         </Box>
-        <Divider sx={{ borderColor: 'rgba(255,255,255,0.08)', mb: 1 }} />
-        <List sx={{ px: 1 }}>
+        <Divider sx={{ borderColor: 'rgba(148,163,184,0.10)', mb: 1 }} />
+        <List sx={{ px: 1.25 }}>
           {navItems.map((item) => {
             const active = location.pathname === item.path ||
               (item.path !== '/' && location.pathname.startsWith(item.path));
@@ -59,30 +73,39 @@ export default function Layout({ children }) {
                 key={item.path}
                 onClick={() => navigate(item.path)}
                 sx={{
-                  borderRadius: '10px',
-                  mb: 0.5,
-                  bgcolor: active ? 'rgba(255,255,255,0.1)' : 'transparent',
-                  '&:hover': { bgcolor: 'rgba(255,255,255,0.06)' },
+                  borderRadius: '11px',
+                  mb: 0.4,
+                  py: 0.9,
+                  position: 'relative',
+                  bgcolor: active ? 'rgba(56,189,248,0.12)' : 'transparent',
+                  '&:hover': { bgcolor: active ? 'rgba(56,189,248,0.16)' : 'rgba(148,163,184,0.08)' },
+                  '&::before': active ? {
+                    content: '""', position: 'absolute', left: 0, top: '20%', height: '60%', width: 3,
+                    borderRadius: 4, background: 'linear-gradient(180deg,#38bdf8,#22c55e)',
+                  } : {},
                 }}
               >
-                <ListItemIcon sx={{ color: active ? '#64b5f6' : 'rgba(255,255,255,0.5)', minWidth: 36 }}>
+                <ListItemIcon sx={{ color: active ? '#38bdf8' : '#64748b', minWidth: 38 }}>
                   {item.icon}
                 </ListItemIcon>
                 <ListItemText
                   primary={item.label}
                   primaryTypographyProps={{
-                    fontSize: '0.85rem',
-                    fontWeight: active ? 700 : 500,
-                    color: active ? '#fff' : 'rgba(255,255,255,0.7)',
+                    fontSize: '0.84rem',
+                    fontWeight: active ? 800 : 600,
+                    color: active ? '#fff' : '#94a3b8',
                   }}
                 />
+                {item.highlight && !active && (
+                  <Chip label="2.0" size="small" sx={{ height: 18, fontSize: '0.6rem', bgcolor: 'rgba(34,197,94,0.18)', color: '#22c55e', fontWeight: 800 }} />
+                )}
               </ListItemButton>
             );
           })}
         </List>
       </Drawer>
 
-      <Box sx={{ flex: 1, overflow: 'auto', bgcolor: '#f4f6f8', minWidth: 0 }}>
+      <Box sx={{ flex: 1, overflow: 'auto', bgcolor: 'background.default', minWidth: 0 }}>
         {children}
       </Box>
     </Box>

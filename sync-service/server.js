@@ -942,8 +942,9 @@ app.post('/api/cmu/org-stats', async (req, res) => {
         SELECT
           COUNT(*)::int as total,
           COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Ativa')::int as ativas,
-          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Desconectada')::int as desconectadas,
-          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Cancelada')::int as canceladas
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Inativa')::int as inativas,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Suspenso')::int as suspensos,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus' = 'Excluída')::int as excluidas
         FROM cmu_energy_meters
         WHERE data->>'organization' = $1
       `, [organization]),
@@ -1027,6 +1028,175 @@ app.post('/api/cmu/org-stats', async (req, res) => {
     console.error('Erro em /api/cmu/org-stats:', err);
     res.status(500).json({ error: err.message });
   }
+});
+
+// ============================================================
+// FINANCEIRO 2.0 — Desembolso UAU (pre-classificado) x Receita CMU
+// Lê das tabelas uau_desembolso + spe_estrutura (ver docs/FINANCEIRO_2.0.md).
+// 3 níveis: /grupo (tudo) · /cluster/:nome · /spe/:empresa.
+// ============================================================
+
+// Converte "mm/yyyy" -> "yyyy-mm-01" (ou null se vazio/invalido)
+function mmYyyyToDate(s) {
+  if (!s || !/^\d{2}\/\d{4}$/.test(s)) return null;
+  const [mm, yyyy] = s.split('/');
+  return `${yyyy}-${mm}-01`;
+}
+
+// Agrega uau_desembolso para um conjunto de empresas (ou todas se empresaList=null).
+// Retorna blocos/status, série mensal, categorias, top obras e indicadores executivos.
+async function aggDesembolso({ empresaList = null, startDate = null, endDate = null }) {
+  const conds = [];
+  const params = [];
+  if (empresaList && empresaList.length) {
+    params.push(empresaList);
+    conds.push(`empresa = ANY($${params.length})`);
+  }
+  if (startDate) { params.push(startDate); conds.push(`ref_mes >= $${params.length}`); }
+  if (endDate) { params.push(endDate); conds.push(`ref_mes <= $${params.length}`); }
+  const where = conds.length ? 'WHERE ' + conds.join(' AND ') : '';
+
+  const [blocoStatus, porMes, porCategoria, topObras, totaisRow] = await Promise.all([
+    pool.query(`SELECT bloco, status, SUM(total_liq)::float total, SUM(qtd_linhas)::int qtd
+      FROM uau_desembolso ${where} GROUP BY bloco, status`, params),
+    pool.query(`SELECT to_char(ref_mes,'YYYY-MM') mes, bloco, SUM(total_liq)::float total
+      FROM uau_desembolso ${where} ${where ? 'AND' : 'WHERE'} ref_mes IS NOT NULL
+      GROUP BY 1, 2 ORDER BY 1`, params),
+    pool.query(`SELECT categoria, bloco, SUM(total_liq)::float total, SUM(qtd_linhas)::int qtd
+      FROM uau_desembolso ${where} GROUP BY categoria, bloco ORDER BY total DESC`, params),
+    pool.query(`SELECT empresa, obra, SUM(total_liq)::float total
+      FROM uau_desembolso ${where} GROUP BY empresa, obra ORDER BY total DESC LIMIT 15`, params),
+    pool.query(`SELECT
+        SUM(total_liq)::float total,
+        SUM(total_liq) FILTER (WHERE status='Pago')::float pago,
+        SUM(total_liq) FILTER (WHERE status='Pagar')::float pagar,
+        SUM(total_liq) FILTER (WHERE bloco='Financiamento')::float financiamento,
+        SUM(total_liq) FILTER (WHERE bloco='Financiamento' AND categoria LIKE 'Amortiza%')::float amortizacao,
+        SUM(total_liq) FILTER (WHERE bloco='Financiamento' AND categoria LIKE '%Juros%')::float juros,
+        SUM(total_liq) FILTER (WHERE bloco='O&M')::float om,
+        SUM(total_liq) FILTER (WHERE bloco='CAPEX')::float capex,
+        SUM(total_liq) FILTER (WHERE bloco='Não classificado')::float nao_class
+      FROM uau_desembolso ${where}`, params),
+  ]);
+
+  const t = totaisRow.rows[0];
+  const num = (v) => Number(v) || 0;
+  // blocos: { Financiamento: {Pago, Pagar, Projetado, total}, ... }
+  const blocos = {};
+  for (const r of blocoStatus.rows) {
+    if (!blocos[r.bloco]) blocos[r.bloco] = { Pago: 0, Pagar: 0, Projetado: 0, total: 0 };
+    blocos[r.bloco][r.status] = (blocos[r.bloco][r.status] || 0) + num(r.total);
+    blocos[r.bloco].total += num(r.total);
+  }
+  // série mensal: [{mes, Financiamento, O&M, ...}]
+  const mesMap = {};
+  for (const r of porMes.rows) {
+    if (!mesMap[r.mes]) mesMap[r.mes] = { mes: r.mes };
+    mesMap[r.mes][r.bloco] = num(r.total);
+  }
+  const serieMensal = Object.values(mesMap).sort((a, b) => a.mes.localeCompare(b.mes));
+
+  const servicoDivida = num(t.amortizacao) + num(t.juros);
+  return {
+    totais: {
+      total: num(t.total), pago: num(t.pago), pagar: num(t.pagar),
+      financiamento: num(t.financiamento), amortizacao: num(t.amortizacao),
+      juros: num(t.juros), operacional: num(t.om), capex: num(t.capex),
+      naoClassificado: num(t.nao_class), servicoDivida,
+    },
+    blocos,
+    porCategoria: porCategoria.rows,
+    topObras: topObras.rows,
+    serieMensal,
+  };
+}
+
+// Lista de clusters (para navegação)
+app.get('/api/fin2/clusters', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT s.cluster,
+        COUNT(DISTINCT s.empresa)::int empresas,
+        COALESCE(SUM(u.total_liq) FILTER (WHERE u.status='Pago'),0)::float pago
+      FROM spe_estrutura s
+      LEFT JOIN uau_desembolso u ON u.empresa = s.empresa
+      WHERE s.cluster IS NOT NULL
+      GROUP BY 1 ORDER BY pago DESC NULLS LAST`);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Nível GRUPO (consolidado)
+app.get('/api/fin2/grupo', async (req, res) => {
+  try {
+    const startDate = mmYyyyToDate(req.query.mesInicial);
+    const endDate = mmYyyyToDate(req.query.mesFinal);
+    const agg = await aggDesembolso({ startDate, endDate });
+    const porCluster = await pool.query(`
+      SELECT COALESCE(s.cluster,'(sem cluster)') cluster, SUM(u.total_liq)::float total
+      FROM uau_desembolso u LEFT JOIN spe_estrutura s ON s.empresa=u.empresa
+      ${startDate ? "WHERE u.ref_mes >= '" + startDate + "'" : ''}
+      ${endDate ? (startDate ? ' AND' : ' WHERE') + " u.ref_mes <= '" + endDate + "'" : ''}
+      GROUP BY 1 ORDER BY total DESC NULLS LAST`);
+    res.json({ nivel: 'grupo', mesInicial: req.query.mesInicial, mesFinal: req.query.mesFinal, ...agg, porCluster: porCluster.rows });
+  } catch (err) { console.error('fin2/grupo:', err); res.status(500).json({ error: err.message }); }
+});
+
+// Nível CLUSTER
+app.get('/api/fin2/cluster/:cluster', async (req, res) => {
+  try {
+    const startDate = mmYyyyToDate(req.query.mesInicial);
+    const endDate = mmYyyyToDate(req.query.mesFinal);
+    const speRes = await pool.query('SELECT empresa, nome, tipo FROM spe_estrutura WHERE cluster = $1', [req.params.cluster]);
+    const empresaList = speRes.rows.map(r => r.empresa);
+    if (!empresaList.length) return res.status(404).json({ error: 'Cluster sem empresas' });
+    const agg = await aggDesembolso({ empresaList, startDate, endDate });
+    res.json({ nivel: 'cluster', cluster: req.params.cluster, empresas: speRes.rows, ...agg });
+  } catch (err) { console.error('fin2/cluster:', err); res.status(500).json({ error: err.message }); }
+});
+
+// Nível SPE
+app.get('/api/fin2/spe/:empresa', async (req, res) => {
+  try {
+    const empresa = parseInt(req.params.empresa, 10);
+    if (!Number.isFinite(empresa)) return res.status(400).json({ error: 'empresa invalida' });
+    const startDate = mmYyyyToDate(req.query.mesInicial);
+    const endDate = mmYyyyToDate(req.query.mesFinal);
+    const speRes = await pool.query('SELECT * FROM spe_estrutura WHERE empresa = $1', [empresa]);
+    const agg = await aggDesembolso({ empresaList: [empresa], startDate, endDate });
+    res.json({ nivel: 'spe', empresa, spe: speRes.rows[0] || null, ...agg });
+  } catch (err) { console.error('fin2/spe:', err); res.status(500).json({ error: err.message }); }
+});
+
+// De-para SPE(UAU) -> organização(CMU), persistido e autoritativo.
+// O match textual é frágil (SPE vs Consórcio têm nomes diferentes); este mapa manual
+// é a fonte da verdade. O frontend usa o salvo se existir; senão, palpite + escolha manual.
+(async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS fin2_spe_org (
+      empresa INT PRIMARY KEY, organization TEXT NOT NULL, updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+  } catch (e) { console.warn('init fin2_spe_org:', e.message); }
+})();
+
+app.get('/api/fin2/spe-org/:empresa', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT organization FROM fin2_spe_org WHERE empresa = $1', [parseInt(req.params.empresa, 10)]);
+    res.json({ organization: r.rows[0]?.organization || null });
+  } catch (err) { res.json({ organization: null }); }
+});
+
+app.post('/api/fin2/spe-org', async (req, res) => {
+  const { empresa, organization } = req.body || {};
+  if (!empresa || !organization) return res.status(400).json({ error: 'empresa e organization obrigatorios' });
+  try {
+    await pool.query(
+      `INSERT INTO fin2_spe_org (empresa, organization) VALUES ($1, $2)
+       ON CONFLICT (empresa) DO UPDATE SET organization = EXCLUDED.organization, updated_at = NOW()`,
+      [parseInt(empresa, 10), organization]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
 // ============================================================
@@ -1192,7 +1362,7 @@ app.post('/api/uau/auth/refresh', async (req, res) => {
 // --- Empresas ativas (SPEs das usinas GVS) ---
 app.get('/api/uau/empresas', async (req, res) => {
   try {
-    const data = await uauCall('Empresa', 'ObterEmpresasAtivas', {});
+    const data = await uauCall('Empresa', 'ObterEmpresasAtivas', {}, { timeout: 8000 });
     res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
   } catch (err) {
     res.status(500).json(uauErrorPayload(err));
@@ -1522,7 +1692,7 @@ app.get('/api/uau/catalog', (req, res) => {
   });
 });
 
-const PORT = 3001;
+const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
   console.log(`Backend Solatio rodando em http://localhost:${PORT}`);
 });
