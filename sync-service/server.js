@@ -17,7 +17,18 @@ function classifyInsumo(insumo) {
 }
 
 const app = express();
-app.use(cors());
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : [];
+
+app.use(cors({
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true); // server-to-server / curl
+    if (!ALLOWED_ORIGINS.length) return cb(null, true); // dev: sem restrição
+    if (ALLOWED_ORIGINS.some(o => origin.startsWith(o))) return cb(null, true);
+    cb(new Error(`CORS: origin ${origin} not allowed`));
+  },
+}));
 app.use(express.json());
 
 const pool = new Pool({
