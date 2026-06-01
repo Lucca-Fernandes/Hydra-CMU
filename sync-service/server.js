@@ -1132,12 +1132,16 @@ app.get('/api/fin2/grupo', async (req, res) => {
     const startDate = mmYyyyToDate(req.query.mesInicial);
     const endDate = mmYyyyToDate(req.query.mesFinal);
     const agg = await aggDesembolso({ startDate, endDate });
+    const pcParams = [];
+    const pcConds = [];
+    if (startDate) { pcParams.push(startDate); pcConds.push(`u.ref_mes >= $${pcParams.length}`); }
+    if (endDate) { pcParams.push(endDate); pcConds.push(`u.ref_mes <= $${pcParams.length}`); }
+    const pcWhere = pcConds.length ? 'WHERE ' + pcConds.join(' AND ') : '';
     const porCluster = await pool.query(`
       SELECT COALESCE(s.cluster,'(sem cluster)') cluster, SUM(u.total_liq)::float total
       FROM uau_desembolso u LEFT JOIN spe_estrutura s ON s.empresa=u.empresa
-      ${startDate ? "WHERE u.ref_mes >= '" + startDate + "'" : ''}
-      ${endDate ? (startDate ? ' AND' : ' WHERE') + " u.ref_mes <= '" + endDate + "'" : ''}
-      GROUP BY 1 ORDER BY total DESC NULLS LAST`);
+      ${pcWhere}
+      GROUP BY 1 ORDER BY total DESC NULLS LAST`, pcParams);
     res.json({ nivel: 'grupo', mesInicial: req.query.mesInicial, mesFinal: req.query.mesFinal, ...agg, porCluster: porCluster.rows });
   } catch (err) { console.error('fin2/grupo:', err); res.status(500).json({ error: err.message }); }
 });
