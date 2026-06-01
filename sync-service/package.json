@@ -6,7 +6,12 @@
     "test": "echo \"Error: no test specified\" && exit 1",
     "sync": "node sync_v2.js",
     "sync:full": "node sync_v2.js --full",
-    "server": "node server.js"
+    "sync:fresh": "node sync_v2.js --full --fresh",
+    "server": "node server.js",
+    "seed:plano": "node seed_plano_contas.js",
+    "seed:spe": "node seed_spe_estrutura.js",
+    "ingest": "node ingest_desembolso.js",
+    "export": "node export_desembolso.js"
   },
   "keywords": [],
   "author": "",
