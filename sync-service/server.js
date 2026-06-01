@@ -1111,9 +1111,16 @@ async function aggDesembolso({ empresaList = null, startDate = null, endDate = n
   };
 }
 
-// Lista de clusters (para navegação)
+let fin2ClustersCache = null;
+let fin2ClustersCacheAt = 0;
+const FIN2_CLUSTERS_TTL = 10 * 60 * 1000; // 10 min
+
+// Lista de clusters (para navegação) — cached, muda raramente
 app.get('/api/fin2/clusters', async (req, res) => {
   try {
+    if (fin2ClustersCache && Date.now() - fin2ClustersCacheAt < FIN2_CLUSTERS_TTL) {
+      return res.json(fin2ClustersCache);
+    }
     const r = await pool.query(`
       SELECT s.cluster,
         COUNT(DISTINCT s.empresa)::int empresas,
@@ -1122,6 +1129,8 @@ app.get('/api/fin2/clusters', async (req, res) => {
       LEFT JOIN uau_desembolso u ON u.empresa = s.empresa
       WHERE s.cluster IS NOT NULL
       GROUP BY 1 ORDER BY pago DESC NULLS LAST`);
+    fin2ClustersCache = r.rows;
+    fin2ClustersCacheAt = Date.now();
     res.json(r.rows);
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
