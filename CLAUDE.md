@@ -154,6 +154,38 @@ Server roda em `http://localhost:3000` (overridable via `PORT`). Cache em memori
 | GET | `/api/cmu/organizations` | Organizacoes distintas com contagem `{total, ativas}` |
 | POST | `/api/cmu/org-stats` | Body `{organization, mesInicial?, mesFinal?}` → metricas de receita CMU |
 
+### Financeiro 2.0 — rotas `/api/fin2/*`
+
+Leem a tabela `uau_desembolso` (pre-classificada por `ingest_desembolso.js`) e cruzam com `spe_estrutura`. Filtros `mesInicial`/`mesFinal` em formato `mm/yyyy` (convertidos por `mmYyyyToDate()`).
+
+| Metodo | Path | Resumo |
+|---|---|---|
+| GET | `/api/fin2/clusters` | Lista clusters com contagem de SPEs e total Pago. Cache 10min |
+| GET | `/api/fin2/grupo` | Consolidado de todas as SPEs. Query: `mesInicial`, `mesFinal`. Retorna `{totais, blocos, porCategoria, topObras, serieMensal, porCluster}` |
+| GET | `/api/fin2/cluster/:cluster` | Agrega SPEs do cluster. Mesmo shape de `/grupo` |
+| GET | `/api/fin2/spe/:empresa` | Agrega uma SPE (`empresa = Codigo_emp UAU`). Inclui `spe` da tabela `spe_estrutura` |
+| GET | `/api/fin2/spe-org/:empresa` | Retorna `{organization}` salvo no mapa SPE→CMU |
+| POST | `/api/fin2/spe-org` | Body `{empresa, organization}` — salva de-para autoritativo em `fin2_spe_org` |
+
+**Tabelas DB extras (Financeiro 2.0)**:
+
+| Tabela | Descricao |
+|---|---|
+| `plano_contas` | Mapa `(Item, Insumo) → categoria`. Populado por `seed_plano_contas.js` do xlsx |
+| `plano_contas_prefixo` | Fallback por prefixo de insumo (ex: `PLN`, `OPE`) |
+| `spe_estrutura` | 293 SPEs com `empresa`, `nome`, `cluster`, `tipo`. Populado por `seed_spe_estrutura.js` |
+| `uau_desembolso` | Desembolso pre-agregado: grao `(empresa, obra, categoria, bloco, status, ref_mes)`. Populado por `ingest_desembolso.js` (~91k linhas) |
+| `fin2_spe_org` | De-para SPE(UAU) → organization(CMU), editavel pelo usuario no frontend |
+
+**Scripts de setup Financeiro 2.0** (rodar uma vez, nesta ordem):
+```bash
+cd sync-service
+node seed_plano_contas.js          # popula plano_contas do xlsx
+node seed_spe_estrutura.js         # popula spe_estrutura (clusters)
+node export_desembolso.js          # baixa ~1.9M linhas da API UAU (5-10min)
+node ingest_desembolso.js          # classifica e agrega → uau_desembolso
+```
+
 ---
 
 ## QUERIES SQL DE REFERENCIA
@@ -225,6 +257,7 @@ Rotas registradas em `src/App.jsx`:
 | `/inadimplencia` | `Inadimplencia.jsx` | Inadimplência |
 | `/uau-api` | `UauApi.jsx` | UAU API |
 | `/gestao-desembolso` | `GestaoDesembolso.jsx` | Gestão Desembolso |
+| `/financeiro-2` | `Financeiro2.jsx` | Financeiro 2.0 (executivo) |
 | `/sync` | `SyncLogs.jsx` | Sync Logs |
 
 `src/pages/Rateio.jsx` ainda existe no disco mas **NAO esta roteado** — pagina mockada/abandonada; rotas server-side `/api/rateio/*` continuam ativas. Se for reativar, importar no `App.jsx`.
@@ -542,13 +575,17 @@ PORT=3000                                              # server.js (default 3000
 | `src/pages/Clientes.jsx` | Listagem + modal cliente |
 | `src/pages/Inadimplencia.jsx` | Inadimplentes |
 | `src/pages/UauApi.jsx` | Explorer UAU |
-| `src/pages/GestaoDesembolso.jsx` | Dashboard cruzado UAU x CMU |
+| `src/pages/GestaoDesembolso.jsx` | Dashboard cruzado UAU x CMU (legado) |
+| `src/pages/Financeiro2.jsx` | Dashboard executivo Financeiro 2.0 (SPE/Cluster/Grupo) |
 | `src/pages/SyncLogs.jsx` | Monitor sync_v2 |
 | `src/pages/Rateio.jsx` | Existe mas nao roteado |
-| `sync-service/server.js` | Express API (CMU + UAU). Bloco UAU em "UAU ERP (Globaltec / Grupo GVS) — Proxy Routes" |
+| `sync-service/server.js` | Express API (CMU + UAU + fin2). Bloco UAU em "UAU ERP (Globaltec / Grupo GVS) — Proxy Routes" |
 | `sync-service/sync_v2.js` | Sync CMU (manter) |
 | `sync-service/export_desembolso.js` | Dump completo `ConsultarDesembolsoPlanejamento` |
 | `sync-service/csv_to_xlsx.js` | CSV → XLSX multi-aba streaming |
+| `sync-service/ingest_desembolso.js` | Le CSV (~1.9M linhas), classifica e agrega → `uau_desembolso` |
+| `sync-service/seed_plano_contas.js` | Popula `plano_contas` + `plano_contas_prefixo` do xlsx |
+| `sync-service/seed_spe_estrutura.js` | Popula `spe_estrutura` (293 SPEs, 22 clusters) do xlsx |
 | `sync-service/data/insumo_map.json` | 758 codigos UAU → categorias plano de contas GVS |
 | `docs/DASHBOARD_FIELDS.md` | Doc de metricas do dashboard CMU |
 | `docs/API_AUDIT.md` | Auditoria da API CMU |
