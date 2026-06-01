@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: hydra-backend
+    runtime: node
+    rootDir: sync-service
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: UAU_BASE_URL
+        sync: false
+      - key: UAU_INTEGRATION_TOKEN
+        sync: false
+      - key: UAU_USER
+        sync: false
+      - key: UAU_PASS
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: NODE_ENV
+        value: production
