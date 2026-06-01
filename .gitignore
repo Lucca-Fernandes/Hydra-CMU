@@ -45,3 +45,8 @@ docs/*.png
 desembolso_planejamento_*.csv
 desembolso_planejamento_*.xlsx
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+.python-version
+
