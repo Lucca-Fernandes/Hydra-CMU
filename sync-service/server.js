@@ -1455,6 +1455,100 @@ app.get('/api/fin3/resumo', async (req, res) => {
   } catch (err) { console.error('fin3/resumo:', err); res.status(500).json({ error: err.message }); }
 });
 
+// GET /api/fin3/inadimplencia — aging real + breakdowns + aging previsto (xlsx)
+app.get('/api/fin3/inadimplencia', async (req, res) => {
+  try {
+    const { mesInicial, mesFinal, cluster } = req.query;
+    const ck = `inad_${cluster || ''}_${mesInicial || ''}_${mesFinal || ''}`;
+    const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
+    const pStart = mmYyyyToDate(mesInicial), pEnd = mmYyyyToDate(mesFinal);
+
+    const clusterWhere = cluster ? `AND m.data->>'organization' IN (SELECT organization FROM fin3_org_cluster WHERE cluster=$1)` : '';
+    const cp = cluster ? [cluster] : [];
+    const [aging, prev, porConc, porTipo, porCluster, porRegiao, porFaixa, agingD15] = await Promise.all([
+      fin3RealAging({ cluster }),
+      fin3Previsto({ cluster, start: pStart, end: pEnd }),
+      pool.query(`
+        SELECT COALESCE(m.data->'distributor'->>'alias','(sem)') label,
+          SUM((p.data->>'totalAmount')::numeric)::float total
+        FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+        WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente') ${clusterWhere}
+        GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 12`, cp),
+      pool.query(`
+        SELECT COALESCE(m.data->>'class','(sem)') label,
+          SUM((p.data->>'totalAmount')::numeric)::float total
+        FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+        WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente') ${clusterWhere}
+        GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, cp),
+      pool.query(`
+        SELECT COALESCE(oc.cluster,'(não mapeado)') label,
+          SUM((p.data->>'totalAmount')::numeric)::float total
+        FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+        LEFT JOIN fin3_org_cluster oc ON oc.organization=m.data->>'organization'
+        WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente')
+        GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, []),
+      // G2: "Regiões com maior inadimplência"
+      pool.query(`
+        SELECT COALESCE(m.data->>'addressState','(sem UF)') label,
+          SUM((p.data->>'totalAmount')::numeric)::float total
+        FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+        WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente') ${clusterWhere}
+        GROUP BY 1 ORDER BY 2 DESC NULLS LAST LIMIT 12`, cp),
+      // G2: "Clusterização por valor de fatura"
+      pool.query(`
+        SELECT CASE
+          WHEN amt <= 200 THEN 'Até R$ 200'
+          WHEN amt <= 500 THEN 'R$ 201–500'
+          WHEN amt <= 1000 THEN 'R$ 501–1.000'
+          WHEN amt <= 5000 THEN 'R$ 1.001–5.000'
+          ELSE 'Acima de R$ 5.000'
+        END label, SUM(amt)::float total, COUNT(*)::int qtd
+        FROM (
+          SELECT (p.data->>'totalAmount')::numeric amt
+          FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+          WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente') ${clusterWhere}
+        ) s GROUP BY 1 ORDER BY MIN(amt)`, cp),
+      // G2: "Dado fixo com fechamento no 15º dia" — snapshot retroativo por referenceMonth:
+      // corte = dia 15 do mês seguinte. Pagamento "recebido D15" se foi pago ATÉ o corte.
+      pool.query(`
+        SELECT to_char(corte,'YYYY-MM') mes,
+          SUM(amt) FILTER (WHERE pago_antes)::float recebido_d15,
+          SUM(amt) FILTER (WHERE NOT pago_antes)::float inadimplente_d15
+        FROM (
+          SELECT (p.data->>'totalAmount')::numeric amt,
+            ((p.data->>'referenceMonth')::date + INTERVAL '1 month' + INTERVAL '14 days')::date corte,
+            (p.data->>'energyMeterPaymentStatus'='Pago'
+              AND p.data->>'paymentDate' IS NOT NULL
+              AND (p.data->>'paymentDate')::date <= ((p.data->>'referenceMonth')::date + INTERVAL '1 month' + INTERVAL '14 days')::date
+            ) pago_antes
+          FROM cmu_energy_meter_payments p JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int=m.id
+          WHERE p.data->>'referenceMonth' IS NOT NULL
+            AND p.data->>'energyMeterPaymentStatus' NOT IN ('Cancelado','Errado','Simulação')
+            ${clusterWhere}
+        ) s GROUP BY 1 ORDER BY 1`, cp),
+    ]);
+    const totalInad = aging.total || 0;
+    const out = {
+      real: {
+        aging,
+        porConcessionaria: porConc.rows,
+        porTipo: porTipo.rows,
+        porCluster: porCluster.rows,
+        porRegiao: porRegiao.rows,
+        porFaixa: porFaixa.rows,
+        total: totalInad,
+      },
+      d15: agingD15.rows,
+      previsto: {
+        d90: prev.totais.d90 || 0, d180: prev.totais.d180 || 0, maior180: prev.totais.maior180 || 0,
+        total: (prev.totais.d90 || 0) + (prev.totais.d180 || 0) + (prev.totais.maior180 || 0),
+      },
+    };
+    fin3CacheSet(ck, out); res.json(out);
+  } catch (err) { console.error('fin3/inadimplencia:', err); res.status(500).json({ error: err.message }); }
+});
+
+
 // ============================================================
 // SYNC LOGS API
 // ============================================================
