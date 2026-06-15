@@ -4,6 +4,8 @@ const cors = require('cors');
 const { Pool } = require('pg');
 const path = require('path');
 const fs = require('fs');
+const multer = require('multer');
+const ExcelJS = require('exceljs');
 
 const INSUMO_MAP = JSON.parse(
   fs.readFileSync(path.join(__dirname, 'data/insumo_map.json'), 'utf-8')
@@ -1222,6 +1224,24 @@ app.post('/api/fin2/spe-org', async (req, res) => {
     res.json({ ok: true });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+
+// ============================================================
+// FINANCEIRO 3.0 — Real (CMU ao vivo) × Previsto (fin3_resumo do xlsx) × Custos (uau_desembolso)
+// ============================================================
+
+let fin3Cache = {};
+const FIN3_TTL = 5 * 60 * 1000;
+const fin3CacheGet = (k) => { const e = fin3Cache[k]; return e && (Date.now() - e.t) < FIN3_TTL ? e.d : null; };
+const fin3CacheSet = (k, d) => { fin3Cache[k] = { d, t: Date.now() }; };
+
+const F3 = {
+  INJ: 'Energia Injetada (MWh)', COMP: 'Energia Compensada (MWh)', TAR: 'Tarifa (R$/MWh)',
+  FAT: 'Valor faturado (R$)', REC: 'Faturamento recebido (R$)', AB: 'Faturamento em Aberto (R$)',
+  EST: 'Estoque (MWh)', D90: 'Em Aberto (Até 90 dias)', D180: 'Em aberto (91 - 180 dias)',
+  D181: 'Inadimplência (Acima 181 dias)',
+};
+
+function mmYyyyToCmu(s) { const d = mmYyyyToDate(s); return d ? d + 'T00:00:00' : null; }
 
 // ============================================================
 // SYNC LOGS API
