@@ -10,6 +10,7 @@
     "server": "node server.js",
     "seed:plano": "node seed_plano_contas.js",
     "seed:spe": "node seed_spe_estrutura.js",
+    "seed:resumo": "node ingest_resumo_graficos.js",
     "ingest": "node ingest_desembolso.js",
     "export": "node export_desembolso.js"
   },
@@ -23,6 +24,7 @@
     "dotenv": "^17.3.1",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "multer": "^2.1.1",
     "pg": "^8.20.0"
   }
 }
