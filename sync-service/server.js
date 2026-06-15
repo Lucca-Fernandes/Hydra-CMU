@@ -1227,6 +1227,12 @@ app.post('/api/fin2/spe-org', async (req, res) => {
 
 // ============================================================
 // FINANCEIRO 3.0 — Real (CMU ao vivo) × Previsto (fin3_resumo do xlsx) × Custos (uau_desembolso)
+// Spec do gestor em docs/financeiro 3.0/ (G2.pdf). Fontes:
+//   REAL     -> cmu_energy_meter_* (faturado/recebido/inadimplência/compensada; aging por data)
+//   PREVISTO -> fin3_resumo (linhas status='PROJETADO', ingeridas de DADOS GERAIS.xlsx)
+//   CUSTOS   -> uau_desembolso (Pago = real; média do realizado = previsto)
+// Chave de cruzamento: cluster (xlsx normalizado p/ "CLUSTER N", = spe_estrutura). CMU agrupa
+// por organization -> cluster via de-para fin3_org_cluster (editável).
 // ============================================================
 
 let fin3Cache = {};
@@ -1234,6 +1240,7 @@ const FIN3_TTL = 5 * 60 * 1000;
 const fin3CacheGet = (k) => { const e = fin3Cache[k]; return e && (Date.now() - e.t) < FIN3_TTL ? e.d : null; };
 const fin3CacheSet = (k, d) => { fin3Cache[k] = { d, t: Date.now() }; };
 
+// Métricas (strings exatas da planilha)
 const F3 = {
   INJ: 'Energia Injetada (MWh)', COMP: 'Energia Compensada (MWh)', TAR: 'Tarifa (R$/MWh)',
   FAT: 'Valor faturado (R$)', REC: 'Faturamento recebido (R$)', AB: 'Faturamento em Aberto (R$)',
@@ -1241,6 +1248,7 @@ const F3 = {
   D181: 'Inadimplência (Acima 181 dias)',
 };
 
+// mm/yyyy -> 'yyyy-mm-01T00:00:00' (CMU referenceMonth é ISO com hora; compara lexicograficamente)
 function mmYyyyToCmu(s) { const d = mmYyyyToDate(s); return d ? d + 'T00:00:00' : null; }
 
 // de-para CMU organization -> cluster (xlsx). Editável; seed dos hints óbvios de nome.
@@ -1265,19 +1273,19 @@ function mmYyyyToCmu(s) { const d = mmYyyyToDate(s); return d ? d + 'T00:00:00' 
 // Filtro CMU comum (cluster via org map + período). Retorna { clause, params } encadeável.
 function cmuFilter({ cluster, start, end }, refCol, orgCol) {
   const conds = []; const params = [];
-  if (cluster) { params.push(cluster); conds.push(`${orgCol} IN (SELECT organization FROM fin3_org_cluster WHERE cluster=${params.length})`); }
-  if (start) { params.push(start); conds.push(`${refCol} >= ${params.length}`); }
-  if (end) { params.push(end); conds.push(`${refCol} <= ${params.length}`); }
+  if (cluster) { params.push(cluster); conds.push(`${orgCol} IN (SELECT organization FROM fin3_org_cluster WHERE cluster=$${params.length})`); }
+  if (start) { params.push(start); conds.push(`${refCol} >= $${params.length}`); }
+  if (end) { params.push(end); conds.push(`${refCol} <= $${params.length}`); }
   return { clause: conds.length ? ' AND ' + conds.join(' AND ') : '', params };
 }
 
 // Previsto (fin3_resumo, PROJETADO) — totais + série mensal + injetado em R$ (injetada×tarifa).
 async function fin3Previsto({ cluster = null, fonte = null, start = null, end = null }) {
   const conds = [`status='PROJETADO'`]; const params = [];
-  if (cluster) { params.push(cluster); conds.push(`cluster=${params.length}`); }
-  if (fonte) { params.push(fonte); conds.push(`fonte=${params.length}`); }
-  if (start) { params.push(start); conds.push(`ref_mes >= ${params.length}`); }
-  if (end) { params.push(end); conds.push(`ref_mes <= ${params.length}`); }
+  if (cluster) { params.push(cluster); conds.push(`cluster=$${params.length}`); }
+  if (fonte) { params.push(fonte); conds.push(`fonte=$${params.length}`); }
+  if (start) { params.push(start); conds.push(`ref_mes >= $${params.length}`); }
+  if (end) { params.push(end); conds.push(`ref_mes <= $${params.length}`); }
   const where = 'WHERE ' + conds.join(' AND ');
   // versão com alias 'i' p/ a query de injetado×tarifa
   const condsI = conds.map(c => c.replace(/^status=/, 'i.status=').replace(/^cluster=/, 'i.cluster=').replace(/^fonte=/, 'i.fonte=').replace(/^ref_mes /, 'i.ref_mes '));
@@ -1288,8 +1296,8 @@ async function fin3Previsto({ cluster = null, fonte = null, start = null, end = 
                 FROM fin3_resumo ${where} GROUP BY 1,2`, params),
     pool.query(`SELECT to_char(i.ref_mes,'YYYY-MM') mes, SUM(i.valor * t.valor)::float total
                 FROM fin3_resumo i JOIN fin3_resumo t
-                  ON t.usina=i.usina AND t.ref_mes=i.ref_mes AND t.status='PROJETADO' AND t.metrica=${params.length + 1}
-                ${whereI} AND i.metrica=${params.length + 2}
+                  ON t.usina=i.usina AND t.ref_mes=i.ref_mes AND t.status='PROJETADO' AND t.metrica=$${params.length + 1}
+                ${whereI} AND i.metrica=$${params.length + 2}
                 GROUP BY 1`, [...params, F3.TAR, F3.INJ]),
   ]);
 
@@ -1361,10 +1369,10 @@ async function fin3RealAging({ cluster = null }) {
 // (prefere REALIZADO no overlap p/ não duplicar).
 async function fin3EnergiaSerie({ cluster = null, fonte = null, start = null, end = null }) {
   const conds = [`metrica IN ('${F3.INJ}','${F3.COMP}','${F3.EST}')`]; const params = [];
-  if (cluster) { params.push(cluster); conds.push(`cluster=${params.length}`); }
-  if (fonte) { params.push(fonte); conds.push(`fonte=${params.length}`); }
-  if (start) { params.push(start); conds.push(`ref_mes >= ${params.length}`); }
-  if (end) { params.push(end); conds.push(`ref_mes <= ${params.length}`); }
+  if (cluster) { params.push(cluster); conds.push(`cluster=$${params.length}`); }
+  if (fonte) { params.push(fonte); conds.push(`fonte=$${params.length}`); }
+  if (start) { params.push(start); conds.push(`ref_mes >= $${params.length}`); }
+  if (end) { params.push(end); conds.push(`ref_mes <= $${params.length}`); }
   const where = 'WHERE ' + conds.join(' AND ');
   const r = await pool.query(`
     SELECT to_char(ref_mes,'YYYY-MM') mes, metrica, SUM(valor)::float total FROM (
@@ -1548,7 +1556,6 @@ app.get('/api/fin3/inadimplencia', async (req, res) => {
   } catch (err) { console.error('fin3/inadimplencia:', err); res.status(500).json({ error: err.message }); }
 });
 
-
 // GET /api/fin3/faturamento — faturado por cluster / concessionária / fonte / tipo
 app.get('/api/fin3/faturamento', async (req, res) => {
   try {
@@ -1568,9 +1575,9 @@ app.get('/api/fin3/faturamento', async (req, res) => {
 
     // previsto por cluster e por fonte (xlsx)
     const prevConds = [`status='PROJETADO'`, `metrica='${F3.FAT}'`]; const prevParams = [];
-    if (cluster) { prevParams.push(cluster); prevConds.push(`cluster=${prevParams.length}`); }
-    if (pStart) { prevParams.push(pStart); prevConds.push(`ref_mes>=${prevParams.length}`); }
-    if (pEnd) { prevParams.push(pEnd); prevConds.push(`ref_mes<=${prevParams.length}`); }
+    if (cluster) { prevParams.push(cluster); prevConds.push(`cluster=$${prevParams.length}`); }
+    if (pStart) { prevParams.push(pStart); prevConds.push(`ref_mes>=$${prevParams.length}`); }
+    if (pEnd) { prevParams.push(pEnd); prevConds.push(`ref_mes<=$${prevParams.length}`); }
     const prevWhere = 'WHERE ' + prevConds.join(' AND ');
 
     const [realConc, realTipo, realCluster, prevCluster, prevFonte] = await Promise.all([
@@ -1601,8 +1608,8 @@ app.get('/api/fin3/custos', async (req, res) => {
 
     // por cluster (quando grupo): soma total_liq por cluster
     const condsC = []; const paramsC = [];
-    if (startDate) { paramsC.push(startDate); condsC.push(`u.ref_mes>=${paramsC.length}`); }
-    if (endDate) { paramsC.push(endDate); condsC.push(`u.ref_mes<=${paramsC.length}`); }
+    if (startDate) { paramsC.push(startDate); condsC.push(`u.ref_mes>=$${paramsC.length}`); }
+    if (endDate) { paramsC.push(endDate); condsC.push(`u.ref_mes<=$${paramsC.length}`); }
     const whereC = condsC.length ? 'WHERE ' + condsC.join(' AND ') : '';
     const porCluster = await pool.query(`
       SELECT COALESCE(s.cluster,'(sem cluster)') label,
@@ -1616,7 +1623,7 @@ app.get('/api/fin3/custos', async (req, res) => {
     let dataFim = null;
     try {
       const dfParams = []; let dfWhere = `obra_dt_fim IS NOT NULL AND obra_dt_fim < '2040-01-01'`;
-      if (empresaList && empresaList.length) { dfParams.push(empresaList); dfWhere += ` AND empresa_codigo = ANY(${dfParams.length})`; }
+      if (empresaList && empresaList.length) { dfParams.push(empresaList); dfWhere += ` AND empresa_codigo = ANY($${dfParams.length})`; }
       const df = await pool.query(`SELECT MAX(obra_dt_fim) m FROM uau_desembolso_agregado WHERE ${dfWhere}`, dfParams);
       dataFim = df.rows[0]?.m || null;
     } catch { /* tabela pode não existir em todos os ambientes */ }
@@ -1642,7 +1649,7 @@ app.get('/api/fin3/usinas', async (req, res) => {
     const ck = `usinas_${cluster || ''}`;
     const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
     const params = []; let where = `usina IS NOT NULL`;
-    if (cluster) { params.push(cluster); where += ` AND cluster=${params.length}`; }
+    if (cluster) { params.push(cluster); where += ` AND cluster=$${params.length}`; }
     const meta = await pool.query(`
       SELECT usina, MAX(cluster) cluster, MAX(fonte) fonte, MAX(concessionaria) concessionaria,
         MAX(potencia_mw)::float potencia, bool_or(operando) operando
@@ -1652,512 +1659,7 @@ app.get('/api/fin3/usinas', async (req, res) => {
     let obras = [];
     try {
       const o = await pool.query(`
-        SELECT UPPER(TRIM(regexp_replace(obra_descricao,'\\s*-\\s*(OPERAÇÃO|IMPLANTAÇÃO|FIN|EPC|VIABILIZAÇÃO|OUTRAS OBRAS|FAT DIRETO|SALÁRIO).*
-// ============================================================
-
-app.get('/api/sync/runs', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 20;
-    const result = await pool.query(
-      'SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT $1', [limit]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar execuções' });
-  }
-});
-
-app.get('/api/sync/runs/:id/logs', async (req, res) => {
-  try {
-    const result = await pool.query(
-      'SELECT * FROM sync_logs WHERE run_id = $1 ORDER BY created_at ASC', [req.params.id]
-    );
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar logs' });
-  }
-});
-
-app.get('/api/sync/control', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM sync_control ORDER BY endpoint_name');
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar sync_control' });
-  }
-});
-
-app.get('/api/sync/logs/recent', async (req, res) => {
-  try {
-    const limit = parseInt(req.query.limit) || 100;
-    const level = req.query.level;
-    let query = 'SELECT * FROM sync_logs';
-    const params = [];
-    if (level) {
-      params.push(level);
-      query += ' WHERE level = $1';
-    }
-    query += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1);
-    params.push(limit);
-    const result = await pool.query(query, params);
-    res.json(result.rows);
-  } catch (err) {
-    res.status(500).json({ error: 'Erro ao buscar logs recentes' });
-  }
-});
-
-// ============================================================
-// UAU ERP (Globaltec / Grupo GVS) — Proxy Routes
-// ============================================================
-// Autenticacao de 2 fatores:
-//   1. X-INTEGRATION-Authorization: token de integracao (fixo no .env)
-//   2. Authorization: <token do usuario>  (SEM prefixo Bearer!)
-// Token de usuario: obtido via POST /api/v1.0/Autenticador/AutenticarUsuario
-// Corpo minimo obrigatorio em POSTs: {}  (IIS exige Content-Length)
-// ============================================================
-
-const axios = require('axios');
-
-const UAU_BASE_URL = process.env.UAU_BASE_URL;
-const UAU_INTEGRATION_TOKEN = process.env.UAU_INTEGRATION_TOKEN;
-const UAU_USER = process.env.UAU_USER;
-const UAU_PASS = process.env.UAU_PASS;
-
-let uauTokenCache = { token: null, expiresAt: 0 };
-const UAU_TOKEN_TTL_MS = 50 * 60 * 1000; // 50 min (UAU expira em ~1h)
-
-async function getUauUserToken({ force = false } = {}) {
-  if (!force && uauTokenCache.token && Date.now() < uauTokenCache.expiresAt) {
-    return uauTokenCache.token;
-  }
-  if (!UAU_BASE_URL || !UAU_INTEGRATION_TOKEN || !UAU_USER || !UAU_PASS) {
-    throw new Error('Variaveis UAU_* nao configuradas no .env');
-  }
-  const url = `${UAU_BASE_URL}/api/v1.0/Autenticador/AutenticarUsuario`;
-  const { data } = await axios.post(
-    url,
-    { Login: UAU_USER, Senha: UAU_PASS },
-    {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
-      },
-      timeout: 30000,
-    }
-  );
-  const token = data?.Token || data?.token || data?.AccessToken || data;
-  if (!token || typeof token !== 'string') {
-    throw new Error('Resposta de autenticacao UAU nao retornou token reconhecivel');
-  }
-  uauTokenCache = { token, expiresAt: Date.now() + UAU_TOKEN_TTL_MS };
-  return token;
-}
-
-async function uauCall(controller, method, body = {}, { retryOn401 = true, timeout = 60000 } = {}) {
-  const token = await getUauUserToken();
-  const url = `${UAU_BASE_URL}/api/v1.0/${controller}/${method}`;
-  try {
-    const { data } = await axios.post(url, body || {}, {
-      headers: {
-        'Content-Type': 'application/json',
-        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
-        'Authorization': token,
-      },
-      timeout,
-    });
-    return data;
-  } catch (err) {
-    const status = err.response?.status;
-    if (status === 401 && retryOn401) {
-      await getUauUserToken({ force: true });
-      return uauCall(controller, method, body, { retryOn401: false });
-    }
-    throw err;
-  }
-}
-
-function uauErrorPayload(err) {
-  return {
-    error: err.message,
-    status: err.response?.status,
-    data: err.response?.data,
-  };
-}
-
-// --- Health / status da conexao ---
-app.get('/api/uau/status', async (req, res) => {
-  try {
-    const token = await getUauUserToken();
-    res.json({
-      connected: true,
-      baseUrl: UAU_BASE_URL,
-      user: UAU_USER,
-      tokenPreview: token.slice(0, 24) + '...',
-      tokenExpiresAt: new Date(uauTokenCache.expiresAt).toISOString(),
-      cachedAt: new Date().toISOString(),
-    });
-  } catch (err) {
-    res.status(500).json({ connected: false, ...uauErrorPayload(err) });
-  }
-});
-
-// --- Forca refresh do token ---
-app.post('/api/uau/auth/refresh', async (req, res) => {
-  try {
-    const token = await getUauUserToken({ force: true });
-    res.json({ ok: true, tokenPreview: token.slice(0, 24) + '...' });
-  } catch (err) {
-    res.status(500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Empresas ativas (SPEs das usinas GVS) ---
-app.get('/api/uau/empresas', async (req, res) => {
-  try {
-    const data = await uauCall('Empresa', 'ObterEmpresasAtivas', {}, { timeout: 8000 });
-    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
-  } catch (err) {
-    res.status(500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Obras ativas ---
-app.get('/api/uau/obras', async (req, res) => {
-  try {
-    const data = await uauCall('Obras', 'ObterObrasAtivas', {});
-    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
-  } catch (err) {
-    res.status(500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Cache simples de obras (5 min) para nao bater o UAU a cada consulta ---
-let obrasCache = { data: null, expiresAt: 0 };
-async function getObrasCached() {
-  if (obrasCache.data && Date.now() < obrasCache.expiresAt) return obrasCache.data;
-  const data = await uauCall('Obras', 'ObterObrasAtivas', {});
-  obrasCache = { data, expiresAt: Date.now() + 5 * 60 * 1000 };
-  return data;
-}
-
-// --- Desembolso agregado por empresa ---
-// Body: { empresa: int, mesInicial: "mm/yyyy", mesFinal: "mm/yyyy" }
-// Percorre todas as obras da empresa, chama Planejamento.ConsultarDesembolsoPlanejamento,
-// agrega e devolve KPIs + series prontas para o grafico + rows brutas.
-app.post('/api/uau/desembolso/empresa', async (req, res) => {
-  const { empresa, mesInicial, mesFinal } = req.body || {};
-  if (!empresa || !mesInicial || !mesFinal) {
-    return res.status(400).json({ error: 'empresa, mesInicial e mesFinal sao obrigatorios' });
-  }
-  const empCode = Number(empresa);
-  if (!Number.isFinite(empCode) || empCode <= 0) {
-    return res.status(400).json({ error: 'empresa deve ser um numero positivo' });
-  }
-  try {
-    const obras = await getObrasCached();
-    const obrasDaEmpresa = obras.filter(o => Number(o.Empresa_obr) === empCode);
-    if (obrasDaEmpresa.length === 0) {
-      return res.json({
-        empresa: empCode, mesInicial, mesFinal,
-        obrasTotal: 0, obrasComDados: 0, linhasTotal: 0,
-        totais: { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
-        porMes: [], porStatus: [], topObras: [], topItens: [], rows: [], errors: [],
-      });
-    }
-
-    const CONCURRENCY = 6;
-    const rows = [];
-    const errors = [];
-    let obrasComDados = 0;
-
-    async function worker(slice) {
-      for (const obra of slice) {
-        try {
-          const data = await uauCall(
-            'Planejamento', 'ConsultarDesembolsoPlanejamento',
-            { Empresa: empCode, Obra: obra.Cod_obr, MesInicial: mesInicial, MesFinal: mesFinal },
-            { timeout: 120000 }
-          );
-          if (Array.isArray(data)) {
-            if (data.length > 0) obrasComDados++;
-            for (const r of data) {
-              rows.push({ ...r, _ObraDescricao: obra.Descr_obr });
-            }
-          }
-        } catch (err) {
-          errors.push({
-            obra: obra.Cod_obr, descricao: obra.Descr_obr,
-            error: err.message, status: err.response?.status,
-          });
-        }
-      }
-    }
-
-    const chunks = Array.from({ length: CONCURRENCY }, () => []);
-    obrasDaEmpresa.forEach((o, i) => chunks[i % CONCURRENCY].push(o));
-    await Promise.all(chunks.map(worker));
-
-    const totais = rows.reduce((acc, r) => {
-      acc.total += Number(r.Total) || 0;
-      acc.totalLiq += Number(r.TotalLiq) || 0;
-      acc.totalBruto += Number(r.TotalBruto) || 0;
-      acc.acrescimo += Number(r.Acrescimo) || 0;
-      acc.desconto += Number(r.Desconto) || 0;
-      return acc;
-    }, { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
-
-    const mesMap = new Map();
-    const statusMap = new Map();
-    const obraMap = new Map();
-    const itemMap = new Map();
-    const catMap = new Map();
-    // categoria por status: { 'Pagar': { 'Amortização': 123, ... }, 'Pago': {...} }
-    const catPorStatus = {};
-
-    let totalAmortizacao = 0;
-    let totalJuros = 0;
-
-    for (const r of rows) {
-      const liq = Number(r.TotalLiq) || 0;
-      const bruto = Number(r.TotalBruto) || 0;
-      const categoria = classifyInsumo(r.Insumo);
-      const st = r.Status || 'sem-status';
-
-      // Separar Amortizacao e Juros
-      if (AMORTIZACAO_CATS.has(categoria)) totalAmortizacao += liq;
-      else if (JUROS_CATS.has(categoria)) totalJuros += liq;
-
-      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
-      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
-      mm.totalLiq += liq;
-      mm.totalBruto += bruto;
-      mm.count++;
-      mesMap.set(ref, mm);
-
-      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
-      sm.total += liq;
-      sm.count++;
-      statusMap.set(st, sm);
-
-      const obraKey = r.Obra;
-      const om = obraMap.get(obraKey) || { obra: obraKey, descricao: r._ObraDescricao, total: 0, count: 0 };
-      om.total += liq;
-      om.count++;
-      obraMap.set(obraKey, om);
-
-      const catKey = categoria;
-      const cm = catMap.get(catKey) || { categoria, total: 0, count: 0 };
-      cm.total += liq;
-      cm.count++;
-      catMap.set(catKey, cm);
-
-      // Breakdown de categoria por status
-      if (!catPorStatus[st]) catPorStatus[st] = {};
-      catPorStatus[st][categoria] = (catPorStatus[st][categoria] || 0) + liq;
-
-      // Top itens mostra categoria + item do cronograma
-      const itemKey = `${categoria} | ${r.Item || '-'}`;
-      const im = itemMap.get(itemKey) || { item: r.Item, categoria, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
-      im.total += liq;
-      im.count++;
-      itemMap.set(itemKey, im);
-    }
-
-    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
-    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
-    const topObras = Array.from(obraMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
-    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
-    const porCategoria = Array.from(catMap.values()).sort((a, b) => b.total - a.total);
-    const totalOperacional = totais.totalLiq - totalAmortizacao - totalJuros;
-
-    res.json({
-      empresa: empCode, mesInicial, mesFinal,
-      obrasTotal: obrasDaEmpresa.length,
-      obrasComDados,
-      linhasTotal: rows.length,
-      totais,
-      totalAmortizacao,
-      totalJuros,
-      totalOperacional,
-      porMes, porStatus, porCategoria, catPorStatus, topObras, topItens,
-      errors,
-    });
-  } catch (err) {
-    res.status(500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Detalhes de uma obra específica ---
-app.post('/api/uau/desembolso/obra', async (req, res) => {
-  const { empresa, obra, mesInicial, mesFinal } = req.body || {};
-  if (!empresa || !obra || !mesInicial || !mesFinal) {
-    return res.status(400).json({ error: 'empresa, obra, mesInicial e mesFinal sao obrigatorios' });
-  }
-  try {
-    const obras = await getObrasCached();
-    const obraData = obras.find(o => String(o.Cod_obr) === String(obra));
-    if (!obraData) {
-      return res.status(404).json({ error: 'Obra nao encontrada' });
-    }
-
-    const rows = await uauCall(
-      'Planejamento', 'ConsultarDesembolsoPlanejamento',
-      { Empresa: Number(empresa), Obra: String(obra), MesInicial: mesInicial, MesFinal: mesFinal },
-      { timeout: 120000 }
-    );
-
-    if (!Array.isArray(rows) || rows.length === 0) {
-      return res.json({
-        obra: obraData, rows: [],
-        porMes: [], porStatus: [], topItens: [],
-        totais: { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
-      });
-    }
-
-    const totais = rows.reduce((acc, r) => {
-      acc.totalLiq += Number(r.TotalLiq) || 0;
-      acc.totalBruto += Number(r.TotalBruto) || 0;
-      acc.acrescimo += Number(r.Acrescimo) || 0;
-      acc.desconto += Number(r.Desconto) || 0;
-      return acc;
-    }, { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
-
-    const mesMap = new Map();
-    const statusMap = new Map();
-    const itemMap = new Map();
-
-    for (const r of rows) {
-      const liq = Number(r.TotalLiq) || 0;
-      const bruto = Number(r.TotalBruto) || 0;
-
-      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
-      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
-      mm.totalLiq += liq;
-      mm.totalBruto += bruto;
-      mm.count++;
-      mesMap.set(ref, mm);
-
-      const st = r.Status || 'sem-status';
-      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
-      sm.total += liq;
-      sm.count++;
-      statusMap.set(st, sm);
-
-      const itemKey = `${r.Item || '-'} | ${r.Composicao || '-'}`;
-      const im = itemMap.get(itemKey) || { item: r.Item, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
-      im.total += liq;
-      im.count++;
-      itemMap.set(itemKey, im);
-    }
-
-    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
-    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
-    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
-
-    res.json({
-      obra: obraData,
-      totais,
-      porMes, porStatus, topItens,
-      rows,
-    });
-  } catch (err) {
-    res.status(500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Proxy generico: POST { controller, method, body } ---
-app.post('/api/uau/call', async (req, res) => {
-  const { controller, method, body, timeout } = req.body || {};
-  if (!controller || !method) {
-    return res.status(400).json({ error: 'controller e method sao obrigatorios' });
-  }
-  try {
-    const data = await uauCall(controller, method, body || {}, { timeout: timeout || 60000 });
-    res.json({ ok: true, data });
-  } catch (err) {
-    res.status(err.response?.status || 500).json(uauErrorPayload(err));
-  }
-});
-
-// --- Catalogo de endpoints UAU (validado em 2026-04-14) ---
-// status: 'ok' = funciona | 'params' = existe mas exige parametros | 'slow' = timeout | 'missing' = 404
-app.get('/api/uau/catalog', (req, res) => {
-  res.json({
-    rfs: [
-      {
-        id: 'MASTER',
-        title: 'Dados mestre — funcionais sem parametros',
-        endpoints: [
-          { controller: 'Empresa', method: 'ObterEmpresasAtivas', desc: '322 SPEs do Grupo GVS', status: 'ok', body: {} },
-          { controller: 'Obras', method: 'ObterObrasAtivas', desc: '1429 obras (CGHs, ADM, manutencao)', status: 'ok', body: {} },
-        ],
-      },
-      {
-        id: 'RF02',
-        title: 'Captacao Projetada x Realizada — exige parametros',
-        endpoints: [
-          {
-            controller: 'Planejamento', method: 'ConsultarDesembolsoPlanejamento',
-            desc: 'Desembolso planejado por obra/mes — retorna Status, Item, Insumo, DtaRef, Total, TotalLiq',
-            status: 'params',
-            body: { Empresa: 1, Obra: '102', MesInicial: '01/2024', MesFinal: '12/2025' },
-          },
-          {
-            controller: 'ProcessoPagamento', method: 'ConsultarProcessos',
-            desc: 'Processos de pagamento — endpoint MUITO lento (timeout >3min mesmo com filtros)',
-            status: 'slow',
-            body: { Empresa: 1, Obra: '102' },
-          },
-        ],
-      },
-      {
-        id: 'RF04',
-        title: 'Medicao de obras — consulta pontual',
-        endpoints: [
-          {
-            controller: 'Medicao', method: 'ConsultarMedicao',
-            desc: 'Detalha uma medicao especifica — exige codigo do contrato e da medicao',
-            status: 'params',
-            body: { empresa: 1, contrato: 1, medicao: 1 },
-          },
-        ],
-      },
-      {
-        id: 'DISCOVERY',
-        title: 'Endpoints chutados que NAO existem (404)',
-        endpoints: [
-          { controller: 'Pessoas', method: 'ObterPessoas', desc: '404 — controller nao existe', status: 'missing' },
-          { controller: 'Localidade', method: 'ObterLocalidades', desc: '404', status: 'missing' },
-          { controller: 'Recebiveis', method: 'ConsultarRecebiveis', desc: '404', status: 'missing' },
-          { controller: 'ExtratoDoCliente', method: 'ObterExtratoDoCliente', desc: '404', status: 'missing' },
-          { controller: 'BoletoServices', method: 'ObterBoletoPorTitulo', desc: '404', status: 'missing' },
-          { controller: 'CobrancaPix', method: 'ObterCobrancaPix', desc: '404', status: 'missing' },
-          { controller: 'CessaoRecebiveis', method: 'ObterCessoes', desc: '404', status: 'missing' },
-          { controller: 'Venda', method: 'ObterVendasPorEmpresa', desc: '404', status: 'missing' },
-          { controller: 'NotasFiscais', method: 'ConsultarNotasFiscais', desc: '404', status: 'missing' },
-          { controller: 'Fiscal', method: 'ObterImpostos', desc: '404', status: 'missing' },
-          { controller: 'Contabil', method: 'ConsultarLancamentos', desc: '404', status: 'missing' },
-          { controller: 'Planejamento', method: 'ConsultarCurvaFisicoFinanceira', desc: '404 — metodo nao existe', status: 'missing' },
-        ],
-      },
-    ],
-  });
-});
-
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, () => {
-  console.log(`Backend Solatio rodando em http://localhost:${PORT}`);
-});
-
-server.on('error', (err) => {
-  if (err.code === 'EADDRINUSE') {
-    console.error(`\nERRO: porta ${PORT} ja esta em uso. Encerre o processo anterior e tente novamente.\n  kill $(lsof -ti :${PORT})\n`);
-  } else {
-    console.error('Erro no servidor:', err);
-  }
-  process.exit(1);
-});
-,'','i'))) nome,
+        SELECT UPPER(TRIM(regexp_replace(obra_descricao,'\\s*-\\s*(OPERAÇÃO|IMPLANTAÇÃO|FIN|EPC|VIABILIZAÇÃO|OUTRAS OBRAS|FAT DIRETO|SALÁRIO).*$','','i'))) nome,
           MAX(obra_dt_fim) dt_fim,
           bool_or(obra_descricao ~* 'OPERAÇÃO') oper,
           bool_or(obra_descricao ~* 'IMPLANTAÇÃO') impl
@@ -2320,7 +1822,7 @@ app.post('/api/fin3/upload-resumo', uploadResumo.single('file'), async (req, res
         const vals = [], params = [];
         slice.forEach((r, j) => {
           const b = j * 10;
-          vals.push(`(${b+1},${b+2},${b+3},${b+4},${b+5},${b+6},${b+7},${b+8},${b+9},${b+10})`);
+          vals.push(`($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10})`);
           params.push(r.usina, r.cluster, r.fonte, r.concessionaria, r.potencia, r.operando, r.status, r.metrica, r.ref, r.valor);
         });
         await client.query(
