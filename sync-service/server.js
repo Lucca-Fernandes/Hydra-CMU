@@ -1243,6 +1243,218 @@ const F3 = {
 
 function mmYyyyToCmu(s) { const d = mmYyyyToDate(s); return d ? d + 'T00:00:00' : null; }
 
+// de-para CMU organization -> cluster (xlsx). Editável; seed dos hints óbvios de nome.
+(async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS fin3_org_cluster (
+      organization TEXT PRIMARY KEY, cluster TEXT, fonte TEXT, updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    const seed = [
+      ['Consórcio GV I', 'CLUSTER I'], ['Consórcio GV VI', 'CLUSTER VI'],
+      ['Consórcio GV VII', 'CLUSTER VII'], ['Consórcio GV VIII', 'CLUSTER VIII'],
+      ['Consórcio Dourados I - MATRIZ (Cluster 7)', 'CLUSTER VII'],
+      ['Consórcio Dourados I - MATRIZ (Cluster 8)', 'CLUSTER VIII'],
+    ];
+    for (const [o, c] of seed) {
+      await pool.query(`INSERT INTO fin3_org_cluster (organization, cluster) VALUES ($1,$2)
+        ON CONFLICT (organization) DO NOTHING`, [o, c]);
+    }
+  } catch (e) { console.warn('init fin3_org_cluster:', e.message); }
+})();
+
+// Filtro CMU comum (cluster via org map + período). Retorna { clause, params } encadeável.
+function cmuFilter({ cluster, start, end }, refCol, orgCol) {
+  const conds = []; const params = [];
+  if (cluster) { params.push(cluster); conds.push(`${orgCol} IN (SELECT organization FROM fin3_org_cluster WHERE cluster=${params.length})`); }
+  if (start) { params.push(start); conds.push(`${refCol} >= ${params.length}`); }
+  if (end) { params.push(end); conds.push(`${refCol} <= ${params.length}`); }
+  return { clause: conds.length ? ' AND ' + conds.join(' AND ') : '', params };
+}
+
+// Previsto (fin3_resumo, PROJETADO) — totais + série mensal + injetado em R$ (injetada×tarifa).
+async function fin3Previsto({ cluster = null, fonte = null, start = null, end = null }) {
+  const conds = [`status='PROJETADO'`]; const params = [];
+  if (cluster) { params.push(cluster); conds.push(`cluster=${params.length}`); }
+  if (fonte) { params.push(fonte); conds.push(`fonte=${params.length}`); }
+  if (start) { params.push(start); conds.push(`ref_mes >= ${params.length}`); }
+  if (end) { params.push(end); conds.push(`ref_mes <= ${params.length}`); }
+  const where = 'WHERE ' + conds.join(' AND ');
+  // versão com alias 'i' p/ a query de injetado×tarifa
+  const condsI = conds.map(c => c.replace(/^status=/, 'i.status=').replace(/^cluster=/, 'i.cluster=').replace(/^fonte=/, 'i.fonte=').replace(/^ref_mes /, 'i.ref_mes '));
+  const whereI = 'WHERE ' + condsI.join(' AND ');
+
+  const [byMM, injRS] = await Promise.all([
+    pool.query(`SELECT metrica, to_char(ref_mes,'YYYY-MM') mes, SUM(valor)::float total
+                FROM fin3_resumo ${where} GROUP BY 1,2`, params),
+    pool.query(`SELECT to_char(i.ref_mes,'YYYY-MM') mes, SUM(i.valor * t.valor)::float total
+                FROM fin3_resumo i JOIN fin3_resumo t
+                  ON t.usina=i.usina AND t.ref_mes=i.ref_mes AND t.status='PROJETADO' AND t.metrica=${params.length + 1}
+                ${whereI} AND i.metrica=${params.length + 2}
+                GROUP BY 1`, [...params, F3.TAR, F3.INJ]),
+  ]);
+
+  const serieMap = {}; const tot = {};
+  const ensure = (m) => (serieMap[m] = serieMap[m] || { mes: m });
+  const keyOf = { [F3.INJ]: 'injetadaMWh', [F3.COMP]: 'compensadaMWh', [F3.FAT]: 'faturado', [F3.REC]: 'recebido', [F3.AB]: 'emAberto', [F3.EST]: 'estoque', [F3.D90]: 'd90', [F3.D180]: 'd180', [F3.D181]: 'maior180' };
+  for (const r of byMM.rows) {
+    const k = keyOf[r.metrica]; if (!k) continue;
+    ensure(r.mes)[k] = r.total; tot[k] = (tot[k] || 0) + r.total;
+  }
+  let injRSTotal = 0;
+  for (const r of injRS.rows) { ensure(r.mes).injetadoRS = r.total; injRSTotal += r.total; }
+  tot.injetadoRS = injRSTotal;
+  const serie = Object.values(serieMap).sort((a, b) => a.mes.localeCompare(b.mes));
+  return { totais: tot, serie };
+}
+
+// Real (CMU) — núcleo: faturado/compensada (invoices Faturado) + recebido/emAberto (payments).
+async function fin3RealCore({ cluster = null, start = null, end = null }) {
+  const fInv = cmuFilter({ cluster, start, end }, `i.data->>'referenceMonth'`, `m.data->>'organization'`);
+  const fPay = cmuFilter({ cluster, start, end }, `p.data->>'referenceMonth'`, `m.data->>'organization'`);
+  const [inv, pay] = await Promise.all([
+    pool.query(`
+      SELECT to_char((i.data->>'referenceMonth')::timestamp,'YYYY-MM') mes,
+        SUM((i.data->>'totalAmount')::numeric)::float faturado,
+        (SUM((i.data->>'compensatedEnergy')::numeric)/1000.0)::float compensada  -- kWh -> MWh
+      FROM cmu_energy_meter_invoices i
+      JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int = m.id
+      WHERE i.data->>'energyMeterInvoiceStatus'='Faturado' ${fInv.clause}
+      GROUP BY 1 ORDER BY 1`, fInv.params),
+    pool.query(`
+      SELECT to_char((p.data->>'referenceMonth')::timestamp,'YYYY-MM') mes,
+        SUM((p.data->>'totalAmount')::numeric) FILTER (WHERE p.data->>'energyMeterPaymentStatus'='Pago')::float recebido,
+        SUM((p.data->>'totalAmount')::numeric) FILTER (WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente'))::float emaberto
+      FROM cmu_energy_meter_payments p
+      JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int = m.id
+      WHERE 1=1 ${fPay.clause}
+      GROUP BY 1 ORDER BY 1`, fPay.params),
+  ]);
+  const map = {}; const tot = { faturado: 0, compensadaMWh: 0, recebido: 0, emAberto: 0 };
+  const ens = (m) => (map[m] = map[m] || { mes: m, faturado: 0, compensadaMWh: 0, recebido: 0, emAberto: 0 });
+  for (const r of inv.rows) { const e = ens(r.mes); e.faturado = r.faturado || 0; e.compensadaMWh = r.compensada || 0; tot.faturado += e.faturado; tot.compensadaMWh += e.compensadaMWh; }
+  for (const r of pay.rows) { const e = ens(r.mes); e.recebido = r.recebido || 0; e.emAberto = r.emaberto || 0; tot.recebido += e.recebido; tot.emAberto += e.emAberto; }
+  const serie = Object.values(map).sort((a, b) => a.mes.localeCompare(b.mes));
+  return { totais: tot, serie };
+}
+
+// Aging real (CMU) por dias de atraso (CURRENT_DATE - expirationDate) p/ Vencido+Pendente.
+async function fin3RealAging({ cluster = null }) {
+  const f = cmuFilter({ cluster }, `p.data->>'referenceMonth'`, `m.data->>'organization'`);
+  const r = await pool.query(`
+    SELECT CASE WHEN dias<=90 THEN 'd90' WHEN dias<=180 THEN 'd180' ELSE 'maior180' END bucket,
+      SUM(amt)::float total, COUNT(*)::int n
+    FROM (
+      SELECT (p.data->>'totalAmount')::numeric amt,
+        (CURRENT_DATE - (p.data->>'expirationDate')::date) dias
+      FROM cmu_energy_meter_payments p
+      JOIN cmu_energy_meters m ON (p.data->>'energyMeterID')::int = m.id
+      WHERE p.data->>'energyMeterPaymentStatus' IN ('Vencido','Pendente')
+        AND p.data->>'expirationDate' IS NOT NULL ${f.clause}
+    ) s GROUP BY 1`, f.params);
+  const out = { d90: 0, d180: 0, maior180: 0, total: 0 };
+  for (const row of r.rows) { out[row.bucket] = row.total; out.total += row.total; }
+  return out;
+}
+
+// Série de energia p/ o gráfico Injetada×Compensada+Estoque (xlsx). Geração não existe na
+// CMU; aqui unimos REALIZADO (passado) + PROJETADO (futuro), 1 valor por usina/métrica/mês
+// (prefere REALIZADO no overlap p/ não duplicar).
+async function fin3EnergiaSerie({ cluster = null, fonte = null, start = null, end = null }) {
+  const conds = [`metrica IN ('${F3.INJ}','${F3.COMP}','${F3.EST}')`]; const params = [];
+  if (cluster) { params.push(cluster); conds.push(`cluster=${params.length}`); }
+  if (fonte) { params.push(fonte); conds.push(`fonte=${params.length}`); }
+  if (start) { params.push(start); conds.push(`ref_mes >= ${params.length}`); }
+  if (end) { params.push(end); conds.push(`ref_mes <= ${params.length}`); }
+  const where = 'WHERE ' + conds.join(' AND ');
+  const r = await pool.query(`
+    SELECT to_char(ref_mes,'YYYY-MM') mes, metrica, SUM(valor)::float total FROM (
+      SELECT DISTINCT ON (usina, metrica, ref_mes) usina, metrica, ref_mes, valor
+      FROM fin3_resumo ${where}
+      ORDER BY usina, metrica, ref_mes, (status='REALIZADO') DESC
+    ) s GROUP BY 1,2`, params);
+  const map = {}; const kk = { [F3.INJ]: 'injetada', [F3.COMP]: 'compensada', [F3.EST]: 'estoque' };
+  for (const row of r.rows) { (map[row.mes] = map[row.mes] || { mes: row.mes })[kk[row.metrica]] = row.total; }
+  return Object.values(map).sort((a, b) => a.mes.localeCompare(b.mes));
+}
+
+// Empresas de um cluster (p/ custos via aggDesembolso)
+async function clusterEmpresas(cluster) {
+  const r = await pool.query('SELECT empresa FROM spe_estrutura WHERE cluster=$1', [cluster]);
+  return r.rows.map(x => x.empresa);
+}
+
+// GET /api/fin3/dimensions — clusters/fontes/concessionárias/usinas p/ filtros
+app.get('/api/fin3/dimensions', async (req, res) => {
+  try {
+    const cached = fin3CacheGet('dims'); if (cached) return res.json(cached);
+    const [cl, fo, co, us] = await Promise.all([
+      pool.query(`SELECT DISTINCT cluster FROM fin3_resumo WHERE cluster IS NOT NULL ORDER BY 1`),
+      pool.query(`SELECT DISTINCT fonte FROM fin3_resumo WHERE fonte IS NOT NULL ORDER BY 1`),
+      pool.query(`SELECT DISTINCT concessionaria FROM fin3_resumo WHERE concessionaria IS NOT NULL ORDER BY 1`),
+      pool.query(`SELECT DISTINCT usina FROM fin3_resumo WHERE usina IS NOT NULL ORDER BY 1`),
+    ]);
+    const out = { clusters: cl.rows.map(r => r.cluster), fontes: fo.rows.map(r => r.fonte), concessionarias: co.rows.map(r => r.concessionaria), usinas: us.rows.map(r => r.usina) };
+    fin3CacheSet('dims', out); res.json(out);
+  } catch (err) { console.error('fin3/dimensions:', err); res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/fin3/resumo — painel principal: Real + Previsto + Custos + séries dos 2 gráficos
+app.get('/api/fin3/resumo', async (req, res) => {
+  try {
+    const { mesInicial, mesFinal, cluster, fonte } = req.query;
+    const ck = `resumo_${cluster || ''}_${fonte || ''}_${mesInicial || ''}_${mesFinal || ''}`;
+    const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
+    const pStart = mmYyyyToDate(mesInicial), pEnd = mmYyyyToDate(mesFinal);
+    const cStart = mmYyyyToCmu(mesInicial), cEnd = mmYyyyToCmu(mesFinal);
+
+    const empresaList = cluster ? await clusterEmpresas(cluster) : null;
+    const [prev, real, aging, custos, energiaSerie] = await Promise.all([
+      fin3Previsto({ cluster, fonte, start: pStart, end: pEnd }),
+      fin3RealCore({ cluster, start: cStart, end: cEnd }),
+      fin3RealAging({ cluster }),
+      aggDesembolso({ empresaList, startDate: pStart, endDate: pEnd }),
+      fin3EnergiaSerie({ cluster, fonte, start: pStart, end: pEnd }),
+    ]);
+
+    const nMesesReal = real.serie.length || 1;
+    const bl = custos.blocos || {};
+    const blPago = (b) => (bl[b] && bl[b].Pago) || 0;
+    const blPagar = (b) => (bl[b] && bl[b].Pagar) || 0;
+    const out = {
+      nivel: cluster ? 'cluster' : 'grupo', cluster: cluster || null, fonte: fonte || null,
+      mesInicial, mesFinal,
+      real: {
+        injetadoRS: null,          // CMU não tem geração bruta; injetado R$ só no previsto (xlsx)
+        compensadaMWh: real.totais.compensadaMWh,
+        faturado: real.totais.faturado,
+        recebido: real.totais.recebido,
+        inadimplencia: real.totais.emAberto,
+        aging,
+        custos: blPago('O&M'),          // operacional realizado (endividamento à parte)
+        endividamento: blPago('Financiamento'),
+        capex: blPago('CAPEX'),
+        custosTotal: custos.totais.pago,
+        serie: real.serie,
+      },
+      previsto: {
+        injetadaMWh: prev.totais.injetadaMWh || 0,
+        injetadoRS: prev.totais.injetadoRS || 0,
+        compensadaMWh: prev.totais.compensadaMWh || 0,
+        faturado: prev.totais.faturado || 0,
+        recebido: prev.totais.recebido || 0,
+        inadimplencia: prev.totais.emAberto || 0,
+        custos: blPagar('O&M'),         // O&M compromissado (Pagar) no UAU
+        custosMediaRealizada: blPago('O&M') / nMesesReal,  // base p/ projeção estatística
+        endividamento: blPagar('Financiamento'),
+        serie: prev.serie,
+      },
+      custosBlocos: custos.blocos,
+      energiaSerie,   // injetada/compensada/estoque (xlsx, realizado+projetado) p/ o gráfico
+    };
+    fin3CacheSet(ck, out); res.json(out);
+  } catch (err) { console.error('fin3/resumo:', err); res.status(500).json({ error: err.message }); }
+});
+
 // ============================================================
 // SYNC LOGS API
 // ============================================================
