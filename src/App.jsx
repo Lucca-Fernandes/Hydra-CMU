@@ -10,6 +10,7 @@ import SyncLogs from './pages/SyncLogs';
 import UauApi from './pages/UauApi';
 import GestaoDesembolso from './pages/GestaoDesembolso';
 import Financeiro2 from './pages/Financeiro2';
+import Financeiro3 from './pages/Financeiro3';
 
 const theme = createTheme({
   palette: {
@@ -60,6 +61,7 @@ function App() {
             <Route path="/inadimplencia" element={<Inadimplencia />} />
             <Route path="/uau-api" element={<UauApi />} />
             <Route path="/financeiro-2" element={<Financeiro2 />} />
+            <Route path="/financeiro-3" element={<Financeiro3 />} />
             <Route path="/gestao-desembolso" element={<GestaoDesembolso />} />
             <Route path="/sync" element={<SyncLogs />} />
           </Routes>

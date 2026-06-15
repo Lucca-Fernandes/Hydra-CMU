@@ -8,6 +8,7 @@ import SyncIcon from '@mui/icons-material/Sync';
 import ApiIcon from '@mui/icons-material/Api';
 import InsightsIcon from '@mui/icons-material/Insights';
 import AccountBalanceIcon from '@mui/icons-material/AccountBalance';
+import TrendingUpIcon from '@mui/icons-material/TrendingUp';
 import { useNavigate, useLocation } from 'react-router-dom';
 
 const DRAWER_WIDTH = 244;
@@ -19,7 +20,8 @@ const navItems = [
   { label: 'Clientes', path: '/clientes', icon: <PeopleIcon /> },
   { label: 'Inadimplência', path: '/inadimplencia', icon: <WarningAmberIcon /> },
   { label: 'UAU API', path: '/uau-api', icon: <ApiIcon /> },
-  { label: 'Financeiro 2.0', path: '/financeiro-2', icon: <AccountBalanceIcon />, highlight: true },
+  { label: 'Financeiro 2.0', path: '/financeiro-2', icon: <AccountBalanceIcon /> },
+  { label: 'Financeiro 3.0', path: '/financeiro-3', icon: <TrendingUpIcon />, highlight: true, badge: '3.0' },
   { label: 'Sync Logs', path: '/sync', icon: <SyncIcon /> },
 ];
 
@@ -97,7 +99,7 @@ export default function Layout({ children }) {
                   }}
                 />
                 {item.highlight && !active && (
-                  <Chip label="2.0" size="small" sx={{ height: 18, fontSize: '0.6rem', bgcolor: 'rgba(34,197,94,0.18)', color: '#22c55e', fontWeight: 800 }} />
+                  <Chip label={item.badge || '2.0'} size="small" sx={{ height: 18, fontSize: '0.6rem', bgcolor: 'rgba(34,197,94,0.18)', color: '#22c55e', fontWeight: 800 }} />
                 )}
               </ListItemButton>
             );
