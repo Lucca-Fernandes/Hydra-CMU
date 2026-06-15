@@ -1549,6 +1549,807 @@ app.get('/api/fin3/inadimplencia', async (req, res) => {
 });
 
 
+// GET /api/fin3/faturamento — faturado por cluster / concessionária / fonte / tipo
+app.get('/api/fin3/faturamento', async (req, res) => {
+  try {
+    const { mesInicial, mesFinal, cluster } = req.query;
+    const ck = `fat_${cluster || ''}_${mesInicial || ''}_${mesFinal || ''}`;
+    const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
+    const pStart = mmYyyyToDate(mesInicial), pEnd = mmYyyyToDate(mesFinal);
+    const cStart = mmYyyyToCmu(mesInicial), cEnd = mmYyyyToCmu(mesFinal);
+
+    const fc = cmuFilter({ cluster, start: cStart, end: cEnd }, `i.data->>'referenceMonth'`, `m.data->>'organization'`);
+    const invBase = (groupCol) => pool.query(`
+      SELECT COALESCE(${groupCol},'(sem)') label, SUM((i.data->>'totalAmount')::numeric)::float total
+      FROM cmu_energy_meter_invoices i JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int=m.id
+      ${groupCol.includes('oc.') ? 'LEFT JOIN fin3_org_cluster oc ON oc.organization=m.data->>\'organization\'' : ''}
+      WHERE i.data->>'energyMeterInvoiceStatus'='Faturado' ${fc.clause}
+      GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, fc.params);
+
+    // previsto por cluster e por fonte (xlsx)
+    const prevConds = [`status='PROJETADO'`, `metrica='${F3.FAT}'`]; const prevParams = [];
+    if (cluster) { prevParams.push(cluster); prevConds.push(`cluster=${prevParams.length}`); }
+    if (pStart) { prevParams.push(pStart); prevConds.push(`ref_mes>=${prevParams.length}`); }
+    if (pEnd) { prevParams.push(pEnd); prevConds.push(`ref_mes<=${prevParams.length}`); }
+    const prevWhere = 'WHERE ' + prevConds.join(' AND ');
+
+    const [realConc, realTipo, realCluster, prevCluster, prevFonte] = await Promise.all([
+      invBase(`m.data->'distributor'->>'alias'`),
+      invBase(`m.data->>'class'`),
+      invBase(`oc.cluster`),
+      pool.query(`SELECT COALESCE(cluster,'(sem)') label, SUM(valor)::float total FROM fin3_resumo ${prevWhere} GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, prevParams),
+      pool.query(`SELECT COALESCE(fonte,'(sem)') label, SUM(valor)::float total FROM fin3_resumo ${prevWhere} GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, prevParams),
+    ]);
+    const out = {
+      real: { porConcessionaria: realConc.rows, porTipo: realTipo.rows, porCluster: realCluster.rows },
+      previsto: { porCluster: prevCluster.rows, porFonte: prevFonte.rows },
+    };
+    fin3CacheSet(ck, out); res.json(out);
+  } catch (err) { console.error('fin3/faturamento:', err); res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/fin3/custos — UAU clusterizado: por cluster, endividamento separado, cards
+app.get('/api/fin3/custos', async (req, res) => {
+  try {
+    const { mesInicial, mesFinal, cluster } = req.query;
+    const ck = `custos_${cluster || ''}_${mesInicial || ''}_${mesFinal || ''}`;
+    const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
+    const startDate = mmYyyyToDate(mesInicial), endDate = mmYyyyToDate(mesFinal);
+    const empresaList = cluster ? await clusterEmpresas(cluster) : null;
+
+    const agg = await aggDesembolso({ empresaList, startDate, endDate });
+
+    // por cluster (quando grupo): soma total_liq por cluster
+    const condsC = []; const paramsC = [];
+    if (startDate) { paramsC.push(startDate); condsC.push(`u.ref_mes>=${paramsC.length}`); }
+    if (endDate) { paramsC.push(endDate); condsC.push(`u.ref_mes<=${paramsC.length}`); }
+    const whereC = condsC.length ? 'WHERE ' + condsC.join(' AND ') : '';
+    const porCluster = await pool.query(`
+      SELECT COALESCE(s.cluster,'(sem cluster)') label,
+        SUM(u.total_liq)::float total,
+        SUM(u.total_liq) FILTER (WHERE u.status='Pago')::float pago,
+        SUM(u.total_liq) FILTER (WHERE u.bloco='Financiamento')::float endividamento
+      FROM uau_desembolso u LEFT JOIN spe_estrutura s ON s.empresa=u.empresa
+      ${whereC} GROUP BY 1 ORDER BY 2 DESC NULLS LAST`, paramsC);
+
+    // cards: data fim prevista (max obra_dt_fim plausível) p/ as empresas do escopo
+    let dataFim = null;
+    try {
+      const dfParams = []; let dfWhere = `obra_dt_fim IS NOT NULL AND obra_dt_fim < '2040-01-01'`;
+      if (empresaList && empresaList.length) { dfParams.push(empresaList); dfWhere += ` AND empresa_codigo = ANY(${dfParams.length})`; }
+      const df = await pool.query(`SELECT MAX(obra_dt_fim) m FROM uau_desembolso_agregado WHERE ${dfWhere}`, dfParams);
+      dataFim = df.rows[0]?.m || null;
+    } catch { /* tabela pode não existir em todos os ambientes */ }
+
+    const out = {
+      totais: agg.totais, blocos: agg.blocos, porCategoria: agg.porCategoria, topObras: agg.topObras,
+      serieMensal: agg.serieMensal, porCluster: porCluster.rows,
+      cards: {
+        valorPago: agg.totais.pago,
+        valorTotal: agg.totais.total,
+        endividamento: agg.totais.financiamento,
+        dataFimPrevista: dataFim,
+      },
+    };
+    fin3CacheSet(ck, out); res.json(out);
+  } catch (err) { console.error('fin3/custos:', err); res.status(500).json({ error: err.message }); }
+});
+
+// GET /api/fin3/usinas — Conexão Gerencial: metadados xlsx + fase/data fim da obra UAU (por nome)
+app.get('/api/fin3/usinas', async (req, res) => {
+  try {
+    const { cluster } = req.query;
+    const ck = `usinas_${cluster || ''}`;
+    const cached = fin3CacheGet(ck); if (cached) return res.json(cached);
+    const params = []; let where = `usina IS NOT NULL`;
+    if (cluster) { params.push(cluster); where += ` AND cluster=${params.length}`; }
+    const meta = await pool.query(`
+      SELECT usina, MAX(cluster) cluster, MAX(fonte) fonte, MAX(concessionaria) concessionaria,
+        MAX(potencia_mw)::float potencia, bool_or(operando) operando
+      FROM fin3_resumo WHERE ${where} GROUP BY usina ORDER BY usina`, params);
+
+    // fase/data fim: casa nome da usina com obra_descricao do UAU (strip sufixo " - XXX")
+    let obras = [];
+    try {
+      const o = await pool.query(`
+        SELECT UPPER(TRIM(regexp_replace(obra_descricao,'\\s*-\\s*(OPERAÇÃO|IMPLANTAÇÃO|FIN|EPC|VIABILIZAÇÃO|OUTRAS OBRAS|FAT DIRETO|SALÁRIO).*
+// ============================================================
+
+app.get('/api/sync/runs', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const result = await pool.query(
+      'SELECT * FROM sync_runs ORDER BY started_at DESC LIMIT $1', [limit]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar execuções' });
+  }
+});
+
+app.get('/api/sync/runs/:id/logs', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM sync_logs WHERE run_id = $1 ORDER BY created_at ASC', [req.params.id]
+    );
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar logs' });
+  }
+});
+
+app.get('/api/sync/control', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM sync_control ORDER BY endpoint_name');
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar sync_control' });
+  }
+});
+
+app.get('/api/sync/logs/recent', async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 100;
+    const level = req.query.level;
+    let query = 'SELECT * FROM sync_logs';
+    const params = [];
+    if (level) {
+      params.push(level);
+      query += ' WHERE level = $1';
+    }
+    query += ' ORDER BY created_at DESC LIMIT $' + (params.length + 1);
+    params.push(limit);
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (err) {
+    res.status(500).json({ error: 'Erro ao buscar logs recentes' });
+  }
+});
+
+// ============================================================
+// UAU ERP (Globaltec / Grupo GVS) — Proxy Routes
+// ============================================================
+// Autenticacao de 2 fatores:
+//   1. X-INTEGRATION-Authorization: token de integracao (fixo no .env)
+//   2. Authorization: <token do usuario>  (SEM prefixo Bearer!)
+// Token de usuario: obtido via POST /api/v1.0/Autenticador/AutenticarUsuario
+// Corpo minimo obrigatorio em POSTs: {}  (IIS exige Content-Length)
+// ============================================================
+
+const axios = require('axios');
+
+const UAU_BASE_URL = process.env.UAU_BASE_URL;
+const UAU_INTEGRATION_TOKEN = process.env.UAU_INTEGRATION_TOKEN;
+const UAU_USER = process.env.UAU_USER;
+const UAU_PASS = process.env.UAU_PASS;
+
+let uauTokenCache = { token: null, expiresAt: 0 };
+const UAU_TOKEN_TTL_MS = 50 * 60 * 1000; // 50 min (UAU expira em ~1h)
+
+async function getUauUserToken({ force = false } = {}) {
+  if (!force && uauTokenCache.token && Date.now() < uauTokenCache.expiresAt) {
+    return uauTokenCache.token;
+  }
+  if (!UAU_BASE_URL || !UAU_INTEGRATION_TOKEN || !UAU_USER || !UAU_PASS) {
+    throw new Error('Variaveis UAU_* nao configuradas no .env');
+  }
+  const url = `${UAU_BASE_URL}/api/v1.0/Autenticador/AutenticarUsuario`;
+  const { data } = await axios.post(
+    url,
+    { Login: UAU_USER, Senha: UAU_PASS },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
+      },
+      timeout: 30000,
+    }
+  );
+  const token = data?.Token || data?.token || data?.AccessToken || data;
+  if (!token || typeof token !== 'string') {
+    throw new Error('Resposta de autenticacao UAU nao retornou token reconhecivel');
+  }
+  uauTokenCache = { token, expiresAt: Date.now() + UAU_TOKEN_TTL_MS };
+  return token;
+}
+
+async function uauCall(controller, method, body = {}, { retryOn401 = true, timeout = 60000 } = {}) {
+  const token = await getUauUserToken();
+  const url = `${UAU_BASE_URL}/api/v1.0/${controller}/${method}`;
+  try {
+    const { data } = await axios.post(url, body || {}, {
+      headers: {
+        'Content-Type': 'application/json',
+        'X-INTEGRATION-Authorization': UAU_INTEGRATION_TOKEN,
+        'Authorization': token,
+      },
+      timeout,
+    });
+    return data;
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 401 && retryOn401) {
+      await getUauUserToken({ force: true });
+      return uauCall(controller, method, body, { retryOn401: false });
+    }
+    throw err;
+  }
+}
+
+function uauErrorPayload(err) {
+  return {
+    error: err.message,
+    status: err.response?.status,
+    data: err.response?.data,
+  };
+}
+
+// --- Health / status da conexao ---
+app.get('/api/uau/status', async (req, res) => {
+  try {
+    const token = await getUauUserToken();
+    res.json({
+      connected: true,
+      baseUrl: UAU_BASE_URL,
+      user: UAU_USER,
+      tokenPreview: token.slice(0, 24) + '...',
+      tokenExpiresAt: new Date(uauTokenCache.expiresAt).toISOString(),
+      cachedAt: new Date().toISOString(),
+    });
+  } catch (err) {
+    res.status(500).json({ connected: false, ...uauErrorPayload(err) });
+  }
+});
+
+// --- Forca refresh do token ---
+app.post('/api/uau/auth/refresh', async (req, res) => {
+  try {
+    const token = await getUauUserToken({ force: true });
+    res.json({ ok: true, tokenPreview: token.slice(0, 24) + '...' });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Empresas ativas (SPEs das usinas GVS) ---
+app.get('/api/uau/empresas', async (req, res) => {
+  try {
+    const data = await uauCall('Empresa', 'ObterEmpresasAtivas', {}, { timeout: 8000 });
+    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Obras ativas ---
+app.get('/api/uau/obras', async (req, res) => {
+  try {
+    const data = await uauCall('Obras', 'ObterObrasAtivas', {});
+    res.json({ count: Array.isArray(data) ? data.length : 0, items: data });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Cache simples de obras (5 min) para nao bater o UAU a cada consulta ---
+let obrasCache = { data: null, expiresAt: 0 };
+async function getObrasCached() {
+  if (obrasCache.data && Date.now() < obrasCache.expiresAt) return obrasCache.data;
+  const data = await uauCall('Obras', 'ObterObrasAtivas', {});
+  obrasCache = { data, expiresAt: Date.now() + 5 * 60 * 1000 };
+  return data;
+}
+
+// --- Desembolso agregado por empresa ---
+// Body: { empresa: int, mesInicial: "mm/yyyy", mesFinal: "mm/yyyy" }
+// Percorre todas as obras da empresa, chama Planejamento.ConsultarDesembolsoPlanejamento,
+// agrega e devolve KPIs + series prontas para o grafico + rows brutas.
+app.post('/api/uau/desembolso/empresa', async (req, res) => {
+  const { empresa, mesInicial, mesFinal } = req.body || {};
+  if (!empresa || !mesInicial || !mesFinal) {
+    return res.status(400).json({ error: 'empresa, mesInicial e mesFinal sao obrigatorios' });
+  }
+  const empCode = Number(empresa);
+  if (!Number.isFinite(empCode) || empCode <= 0) {
+    return res.status(400).json({ error: 'empresa deve ser um numero positivo' });
+  }
+  try {
+    const obras = await getObrasCached();
+    const obrasDaEmpresa = obras.filter(o => Number(o.Empresa_obr) === empCode);
+    if (obrasDaEmpresa.length === 0) {
+      return res.json({
+        empresa: empCode, mesInicial, mesFinal,
+        obrasTotal: 0, obrasComDados: 0, linhasTotal: 0,
+        totais: { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
+        porMes: [], porStatus: [], topObras: [], topItens: [], rows: [], errors: [],
+      });
+    }
+
+    const CONCURRENCY = 6;
+    const rows = [];
+    const errors = [];
+    let obrasComDados = 0;
+
+    async function worker(slice) {
+      for (const obra of slice) {
+        try {
+          const data = await uauCall(
+            'Planejamento', 'ConsultarDesembolsoPlanejamento',
+            { Empresa: empCode, Obra: obra.Cod_obr, MesInicial: mesInicial, MesFinal: mesFinal },
+            { timeout: 120000 }
+          );
+          if (Array.isArray(data)) {
+            if (data.length > 0) obrasComDados++;
+            for (const r of data) {
+              rows.push({ ...r, _ObraDescricao: obra.Descr_obr });
+            }
+          }
+        } catch (err) {
+          errors.push({
+            obra: obra.Cod_obr, descricao: obra.Descr_obr,
+            error: err.message, status: err.response?.status,
+          });
+        }
+      }
+    }
+
+    const chunks = Array.from({ length: CONCURRENCY }, () => []);
+    obrasDaEmpresa.forEach((o, i) => chunks[i % CONCURRENCY].push(o));
+    await Promise.all(chunks.map(worker));
+
+    const totais = rows.reduce((acc, r) => {
+      acc.total += Number(r.Total) || 0;
+      acc.totalLiq += Number(r.TotalLiq) || 0;
+      acc.totalBruto += Number(r.TotalBruto) || 0;
+      acc.acrescimo += Number(r.Acrescimo) || 0;
+      acc.desconto += Number(r.Desconto) || 0;
+      return acc;
+    }, { total: 0, totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
+
+    const mesMap = new Map();
+    const statusMap = new Map();
+    const obraMap = new Map();
+    const itemMap = new Map();
+    const catMap = new Map();
+    // categoria por status: { 'Pagar': { 'Amortização': 123, ... }, 'Pago': {...} }
+    const catPorStatus = {};
+
+    let totalAmortizacao = 0;
+    let totalJuros = 0;
+
+    for (const r of rows) {
+      const liq = Number(r.TotalLiq) || 0;
+      const bruto = Number(r.TotalBruto) || 0;
+      const categoria = classifyInsumo(r.Insumo);
+      const st = r.Status || 'sem-status';
+
+      // Separar Amortizacao e Juros
+      if (AMORTIZACAO_CATS.has(categoria)) totalAmortizacao += liq;
+      else if (JUROS_CATS.has(categoria)) totalJuros += liq;
+
+      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
+      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
+      mm.totalLiq += liq;
+      mm.totalBruto += bruto;
+      mm.count++;
+      mesMap.set(ref, mm);
+
+      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
+      sm.total += liq;
+      sm.count++;
+      statusMap.set(st, sm);
+
+      const obraKey = r.Obra;
+      const om = obraMap.get(obraKey) || { obra: obraKey, descricao: r._ObraDescricao, total: 0, count: 0 };
+      om.total += liq;
+      om.count++;
+      obraMap.set(obraKey, om);
+
+      const catKey = categoria;
+      const cm = catMap.get(catKey) || { categoria, total: 0, count: 0 };
+      cm.total += liq;
+      cm.count++;
+      catMap.set(catKey, cm);
+
+      // Breakdown de categoria por status
+      if (!catPorStatus[st]) catPorStatus[st] = {};
+      catPorStatus[st][categoria] = (catPorStatus[st][categoria] || 0) + liq;
+
+      // Top itens mostra categoria + item do cronograma
+      const itemKey = `${categoria} | ${r.Item || '-'}`;
+      const im = itemMap.get(itemKey) || { item: r.Item, categoria, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
+      im.total += liq;
+      im.count++;
+      itemMap.set(itemKey, im);
+    }
+
+    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
+    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
+    const topObras = Array.from(obraMap.values()).sort((a, b) => b.total - a.total).slice(0, 10);
+    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
+    const porCategoria = Array.from(catMap.values()).sort((a, b) => b.total - a.total);
+    const totalOperacional = totais.totalLiq - totalAmortizacao - totalJuros;
+
+    res.json({
+      empresa: empCode, mesInicial, mesFinal,
+      obrasTotal: obrasDaEmpresa.length,
+      obrasComDados,
+      linhasTotal: rows.length,
+      totais,
+      totalAmortizacao,
+      totalJuros,
+      totalOperacional,
+      porMes, porStatus, porCategoria, catPorStatus, topObras, topItens,
+      errors,
+    });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Detalhes de uma obra específica ---
+app.post('/api/uau/desembolso/obra', async (req, res) => {
+  const { empresa, obra, mesInicial, mesFinal } = req.body || {};
+  if (!empresa || !obra || !mesInicial || !mesFinal) {
+    return res.status(400).json({ error: 'empresa, obra, mesInicial e mesFinal sao obrigatorios' });
+  }
+  try {
+    const obras = await getObrasCached();
+    const obraData = obras.find(o => String(o.Cod_obr) === String(obra));
+    if (!obraData) {
+      return res.status(404).json({ error: 'Obra nao encontrada' });
+    }
+
+    const rows = await uauCall(
+      'Planejamento', 'ConsultarDesembolsoPlanejamento',
+      { Empresa: Number(empresa), Obra: String(obra), MesInicial: mesInicial, MesFinal: mesFinal },
+      { timeout: 120000 }
+    );
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.json({
+        obra: obraData, rows: [],
+        porMes: [], porStatus: [], topItens: [],
+        totais: { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 },
+      });
+    }
+
+    const totais = rows.reduce((acc, r) => {
+      acc.totalLiq += Number(r.TotalLiq) || 0;
+      acc.totalBruto += Number(r.TotalBruto) || 0;
+      acc.acrescimo += Number(r.Acrescimo) || 0;
+      acc.desconto += Number(r.Desconto) || 0;
+      return acc;
+    }, { totalLiq: 0, totalBruto: 0, acrescimo: 0, desconto: 0 });
+
+    const mesMap = new Map();
+    const statusMap = new Map();
+    const itemMap = new Map();
+
+    for (const r of rows) {
+      const liq = Number(r.TotalLiq) || 0;
+      const bruto = Number(r.TotalBruto) || 0;
+
+      const ref = r.DtaRef ? String(r.DtaRef).slice(0, 7) : 'sem-data';
+      const mm = mesMap.get(ref) || { mes: ref, totalLiq: 0, totalBruto: 0, count: 0 };
+      mm.totalLiq += liq;
+      mm.totalBruto += bruto;
+      mm.count++;
+      mesMap.set(ref, mm);
+
+      const st = r.Status || 'sem-status';
+      const sm = statusMap.get(st) || { status: st, total: 0, count: 0 };
+      sm.total += liq;
+      sm.count++;
+      statusMap.set(st, sm);
+
+      const itemKey = `${r.Item || '-'} | ${r.Composicao || '-'}`;
+      const im = itemMap.get(itemKey) || { item: r.Item, composicao: r.Composicao, insumo: r.Insumo, total: 0, count: 0 };
+      im.total += liq;
+      im.count++;
+      itemMap.set(itemKey, im);
+    }
+
+    const porMes = Array.from(mesMap.values()).sort((a, b) => a.mes.localeCompare(b.mes));
+    const porStatus = Array.from(statusMap.values()).sort((a, b) => b.total - a.total);
+    const topItens = Array.from(itemMap.values()).sort((a, b) => b.total - a.total).slice(0, 15);
+
+    res.json({
+      obra: obraData,
+      totais,
+      porMes, porStatus, topItens,
+      rows,
+    });
+  } catch (err) {
+    res.status(500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Proxy generico: POST { controller, method, body } ---
+app.post('/api/uau/call', async (req, res) => {
+  const { controller, method, body, timeout } = req.body || {};
+  if (!controller || !method) {
+    return res.status(400).json({ error: 'controller e method sao obrigatorios' });
+  }
+  try {
+    const data = await uauCall(controller, method, body || {}, { timeout: timeout || 60000 });
+    res.json({ ok: true, data });
+  } catch (err) {
+    res.status(err.response?.status || 500).json(uauErrorPayload(err));
+  }
+});
+
+// --- Catalogo de endpoints UAU (validado em 2026-04-14) ---
+// status: 'ok' = funciona | 'params' = existe mas exige parametros | 'slow' = timeout | 'missing' = 404
+app.get('/api/uau/catalog', (req, res) => {
+  res.json({
+    rfs: [
+      {
+        id: 'MASTER',
+        title: 'Dados mestre — funcionais sem parametros',
+        endpoints: [
+          { controller: 'Empresa', method: 'ObterEmpresasAtivas', desc: '322 SPEs do Grupo GVS', status: 'ok', body: {} },
+          { controller: 'Obras', method: 'ObterObrasAtivas', desc: '1429 obras (CGHs, ADM, manutencao)', status: 'ok', body: {} },
+        ],
+      },
+      {
+        id: 'RF02',
+        title: 'Captacao Projetada x Realizada — exige parametros',
+        endpoints: [
+          {
+            controller: 'Planejamento', method: 'ConsultarDesembolsoPlanejamento',
+            desc: 'Desembolso planejado por obra/mes — retorna Status, Item, Insumo, DtaRef, Total, TotalLiq',
+            status: 'params',
+            body: { Empresa: 1, Obra: '102', MesInicial: '01/2024', MesFinal: '12/2025' },
+          },
+          {
+            controller: 'ProcessoPagamento', method: 'ConsultarProcessos',
+            desc: 'Processos de pagamento — endpoint MUITO lento (timeout >3min mesmo com filtros)',
+            status: 'slow',
+            body: { Empresa: 1, Obra: '102' },
+          },
+        ],
+      },
+      {
+        id: 'RF04',
+        title: 'Medicao de obras — consulta pontual',
+        endpoints: [
+          {
+            controller: 'Medicao', method: 'ConsultarMedicao',
+            desc: 'Detalha uma medicao especifica — exige codigo do contrato e da medicao',
+            status: 'params',
+            body: { empresa: 1, contrato: 1, medicao: 1 },
+          },
+        ],
+      },
+      {
+        id: 'DISCOVERY',
+        title: 'Endpoints chutados que NAO existem (404)',
+        endpoints: [
+          { controller: 'Pessoas', method: 'ObterPessoas', desc: '404 — controller nao existe', status: 'missing' },
+          { controller: 'Localidade', method: 'ObterLocalidades', desc: '404', status: 'missing' },
+          { controller: 'Recebiveis', method: 'ConsultarRecebiveis', desc: '404', status: 'missing' },
+          { controller: 'ExtratoDoCliente', method: 'ObterExtratoDoCliente', desc: '404', status: 'missing' },
+          { controller: 'BoletoServices', method: 'ObterBoletoPorTitulo', desc: '404', status: 'missing' },
+          { controller: 'CobrancaPix', method: 'ObterCobrancaPix', desc: '404', status: 'missing' },
+          { controller: 'CessaoRecebiveis', method: 'ObterCessoes', desc: '404', status: 'missing' },
+          { controller: 'Venda', method: 'ObterVendasPorEmpresa', desc: '404', status: 'missing' },
+          { controller: 'NotasFiscais', method: 'ConsultarNotasFiscais', desc: '404', status: 'missing' },
+          { controller: 'Fiscal', method: 'ObterImpostos', desc: '404', status: 'missing' },
+          { controller: 'Contabil', method: 'ConsultarLancamentos', desc: '404', status: 'missing' },
+          { controller: 'Planejamento', method: 'ConsultarCurvaFisicoFinanceira', desc: '404 — metodo nao existe', status: 'missing' },
+        ],
+      },
+    ],
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+const server = app.listen(PORT, () => {
+  console.log(`Backend Solatio rodando em http://localhost:${PORT}`);
+});
+
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\nERRO: porta ${PORT} ja esta em uso. Encerre o processo anterior e tente novamente.\n  kill $(lsof -ti :${PORT})\n`);
+  } else {
+    console.error('Erro no servidor:', err);
+  }
+  process.exit(1);
+});
+,'','i'))) nome,
+          MAX(obra_dt_fim) dt_fim,
+          bool_or(obra_descricao ~* 'OPERAÇÃO') oper,
+          bool_or(obra_descricao ~* 'IMPLANTAÇÃO') impl
+        FROM uau_desembolso_agregado WHERE obra_descricao IS NOT NULL GROUP BY 1`);
+      obras = o.rows;
+    } catch { /* opcional */ }
+    const obraMap = {};
+    for (const o of obras) obraMap[o.nome] = o;
+
+    const hoje = new Date();
+    const rows = meta.rows.map(u => {
+      const o = obraMap[(u.usina || '').toUpperCase().trim()];
+      const fase = u.operando ? 'OPERAÇÃO' : (o && o.impl ? 'IMPLANTAÇÃO' : 'DESENVOLVIMENTO');
+      const dtFim = o?.dt_fim && new Date(o.dt_fim) < new Date('2040-01-01') ? o.dt_fim : null;
+      const prazoDias = dtFim ? Math.round((new Date(dtFim) - hoje) / 86400000) : null;
+      return { usina: u.usina, cluster: u.cluster, fonte: u.fonte, concessionaria: u.concessionaria, potencia: u.potencia, operando: u.operando, fase, dataFimPrevista: dtFim, prazoDias };
+    });
+    fin3CacheSet(ck, rows); res.json(rows);
+  } catch (err) { console.error('fin3/usinas:', err); res.status(500).json({ error: err.message }); }
+});
+
+// de-para CMU organization -> cluster (ver/editar) — retorna TODAS as orgs CMU, com mapeamento quando existir
+app.get('/api/fin3/org-cluster', async (req, res) => {
+  try {
+    const r = await pool.query(`
+      SELECT o.org AS organization, oc.cluster, oc.fonte,
+        o.ativas::int, o.total::int,
+        COALESCE(f.faturado,0)::float AS faturado
+      FROM (
+        SELECT data->>'organization' org,
+          COUNT(*) FILTER (WHERE data->>'energyMeterStatus'='Ativa') ativas, COUNT(*) total
+        FROM cmu_energy_meters WHERE data->>'organization' IS NOT NULL GROUP BY 1
+      ) o
+      LEFT JOIN fin3_org_cluster oc ON oc.organization = o.org
+      LEFT JOIN (
+        SELECT m.data->>'organization' org, SUM((i.data->>'totalAmount')::numeric)::float faturado
+        FROM cmu_energy_meter_invoices i
+        JOIN cmu_energy_meters m ON (i.data->>'energyMeterID')::int = m.id
+        WHERE i.data->>'energyMeterInvoiceStatus'='Faturado'
+        GROUP BY 1
+      ) f ON f.org = o.org
+      ORDER BY o.ativas DESC`);
+    res.json(r.rows);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+app.post('/api/fin3/org-cluster', async (req, res) => {
+  const { organization, cluster, fonte } = req.body || {};
+  if (!organization) return res.status(400).json({ error: 'organization obrigatorio' });
+  try {
+    await pool.query(`INSERT INTO fin3_org_cluster (organization, cluster, fonte) VALUES ($1,$2,$3)
+      ON CONFLICT (organization) DO UPDATE SET cluster=EXCLUDED.cluster, fonte=EXCLUDED.fonte, updated_at=NOW()`,
+      [organization, cluster || null, fonte || null]);
+    fin3Cache = {}; // invalida cache (cluster de receita muda)
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Versão da planilha — tabela de controle
+(async () => {
+  try {
+    await pool.query(`CREATE TABLE IF NOT EXISTS fin3_planilha_versao (
+      id SERIAL PRIMARY KEY, arquivo TEXT, versao TEXT, linhas INT,
+      uploaded_at TIMESTAMPTZ DEFAULT NOW(), resumo JSONB
+    )`);
+  } catch (e) { console.warn('init fin3_planilha_versao:', e.message); }
+})();
+
+app.get('/api/fin3/planilha-versao', async (req, res) => {
+  try {
+    const r = await pool.query(`SELECT * FROM fin3_planilha_versao ORDER BY uploaded_at DESC LIMIT 1`);
+    res.json(r.rows[0] || null);
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// POST /api/fin3/upload-resumo — upload xlsx e re-ingest fin3_resumo
+const uploadResumo = multer({ storage: multer.memoryStorage(), limits: { fileSize: 50 * 1024 * 1024 } });
+app.post('/api/fin3/upload-resumo', uploadResumo.single('file'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'Nenhum arquivo enviado' });
+  const versao = req.body?.versao || null;
+  const SHEET = 'Resumo Graficos';
+  const MESES_MAP = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 };
+  const ROMANOS = new Set(['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII']);
+
+  function cv(v) {
+    if (v && typeof v === 'object') {
+      if (v.result !== undefined) return v.result;
+      if (v.text !== undefined) return v.text;
+      if (v.richText) return v.richText.map(t => t.text).join('');
+      return null;
+    }
+    return v;
+  }
+  function toNum(v) {
+    const x = cv(v);
+    if (x === null || x === undefined || x === '') return null;
+    const n = typeof x === 'number' ? x : Number(String(x).replace(/\s/g, '').replace(',', '.'));
+    return Number.isFinite(n) ? n : null;
+  }
+  function txt(v) { const x = cv(v); return x === null || x === undefined ? '' : String(x).trim(); }
+  function mesHeaderToDate(h) {
+    const s = txt(h).toLowerCase();
+    const m = s.match(/^([a-zç]{3})\/(\d{2})$/);
+    if (!m) return null;
+    const mm = MESES_MAP[m[1]];
+    if (!mm) return null;
+    return `${2000 + parseInt(m[2], 10)}-${String(mm).padStart(2, '0')}-01`;
+  }
+  function normCluster(c) {
+    const s = txt(c).toUpperCase();
+    if (!s) return null;
+    return ROMANOS.has(s) ? `CLUSTER ${s}` : s;
+  }
+
+  try {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(req.file.buffer);
+    const ws = wb.getWorksheet(SHEET);
+    if (!ws) return res.status(400).json({ error: `Aba "${SHEET}" não encontrada no arquivo` });
+
+    const monthCols = [];
+    for (let c = 9; c <= ws.columnCount; c++) {
+      const d = mesHeaderToDate(ws.getRow(1).getCell(c).value);
+      if (d) monthCols.push({ col: c, ref: d });
+    }
+    if (!monthCols.length) return res.status(400).json({ error: 'Nenhuma coluna de mês detectada (esperado "jan/24", "fev/24", ...)' });
+
+    const rows = [];
+    for (let r = 2; r <= ws.rowCount; r++) {
+      const row = ws.getRow(r);
+      const usina = txt(row.getCell(3).value);
+      const metrica = txt(row.getCell(8).value);
+      const statusRaw = txt(row.getCell(7).value).toUpperCase();
+      if (!usina || !metrica || !statusRaw) continue;
+      const cluster = normCluster(row.getCell(1).value);
+      const fonte = txt(row.getCell(2).value) || null;
+      const concessionaria = txt(row.getCell(4).value) || null;
+      const potencia = toNum(row.getCell(5).value);
+      const operandoRaw = txt(row.getCell(6).value).toUpperCase();
+      const operando = operandoRaw === 'SIM' ? true : operandoRaw === 'NÃO' || operandoRaw === 'NAO' ? false : null;
+      const status = statusRaw.startsWith('PROJ') ? 'PROJETADO' : 'REALIZADO';
+      for (const { col, ref } of monthCols) {
+        const valor = toNum(row.getCell(col).value);
+        if (valor === null) continue;
+        rows.push({ usina, cluster, fonte, concessionaria, potencia, operando, status, metrica, ref, valor });
+      }
+    }
+    if (!rows.length) return res.status(400).json({ error: 'Nenhuma linha de dados encontrada na aba' });
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE TABLE IF NOT EXISTS fin3_resumo (
+        usina TEXT, cluster TEXT, fonte TEXT, concessionaria TEXT,
+        potencia_mw NUMERIC, operando BOOLEAN, status TEXT, metrica TEXT, ref_mes DATE, valor NUMERIC
+      )`);
+      await client.query('TRUNCATE fin3_resumo');
+      const BATCH = 500;
+      for (let i = 0; i < rows.length; i += BATCH) {
+        const slice = rows.slice(i, i + BATCH);
+        const vals = [], params = [];
+        slice.forEach((r, j) => {
+          const b = j * 10;
+          vals.push(`(${b+1},${b+2},${b+3},${b+4},${b+5},${b+6},${b+7},${b+8},${b+9},${b+10})`);
+          params.push(r.usina, r.cluster, r.fonte, r.concessionaria, r.potencia, r.operando, r.status, r.metrica, r.ref, r.valor);
+        });
+        await client.query(
+          `INSERT INTO fin3_resumo (usina,cluster,fonte,concessionaria,potencia_mw,operando,status,metrica,ref_mes,valor) VALUES ${vals.join(',')}`,
+          params
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK');
+      throw e;
+    } finally {
+      client.release();
+    }
+
+    fin3Cache = {};
+    const summary = await pool.query(`
+      SELECT status, COUNT(*)::int linhas, COUNT(DISTINCT usina)::int usinas,
+             MIN(ref_mes)::text min_mes, MAX(ref_mes)::text max_mes
+      FROM fin3_resumo GROUP BY 1 ORDER BY 1`);
+    await pool.query(`INSERT INTO fin3_planilha_versao (arquivo, versao, linhas, resumo) VALUES ($1,$2,$3,$4)`,
+      [req.file.originalname, versao, rows.length, JSON.stringify(summary.rows)]);
+    res.json({ ok: true, linhas: rows.length, resumo: summary.rows, arquivo: req.file.originalname, versao });
+  } catch (err) {
+    console.error('fin3/upload-resumo:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ============================================================
 // SYNC LOGS API
 // ============================================================
